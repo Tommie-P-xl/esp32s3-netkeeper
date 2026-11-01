@@ -409,8 +409,8 @@ void ui_create(lv_display_t *disp)
     lv_obj_set_style_radius(card, 22, 0);
     lv_obj_set_style_border_width(card, 0, 0);
     lv_obj_set_style_pad_all(card, 0, 0);
-    lv_obj_remove_flag(card, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_remove_flag(card, LV_OBJ_FLAG_CLICKABLE);
+    ui_obj_scrollable(card, false);
+    ui_obj_clickable(card, false);
 
     s_ui.dot = lv_obj_create(card);
     lv_obj_set_size(s_ui.dot, 26, 26);
@@ -419,7 +419,7 @@ void ui_create(lv_display_t *disp)
     lv_obj_set_style_bg_color(s_ui.dot, UI_COL_SKY, 0);
     lv_obj_set_style_bg_opa(s_ui.dot, LV_OPA_COVER, 0);
     lv_obj_set_style_border_width(s_ui.dot, 0, 0);
-    lv_obj_remove_flag(s_ui.dot, LV_OBJ_FLAG_CLICKABLE);
+    ui_obj_clickable(s_ui.dot, false);
 
     s_ui.state_big = ui_label(card, "BOOT", &lv_font_montserrat_40, UI_COL_TEXT);
     lv_obj_set_pos(s_ui.state_big, 70, 18);

@@ -13,7 +13,8 @@
 #include "esp_err.h"
 #include "esp_log.h"
 #include "esp_vfs_fat.h"
-#include "driver/i2c.h"
+/* 这里原来 include 了 driver/i2c.h（legacy 驱动，IDF v6 起 EOL 并会打 CRITICAL
+ * WARNING），但本文件并没有用到任何 i2c API，去掉即可。 */
 #include "driver/i2s_std.h"
 #include "driver/gpio.h"
 #include "driver/ledc.h"

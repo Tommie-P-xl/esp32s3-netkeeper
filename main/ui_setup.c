@@ -13,8 +13,6 @@
 #include "ui_common.h"
 #include "wifi_mgr.h"
 
-static const char *TAG = "ui_setup";
-
 #define MAX_AP   20
 #define MAX_ROWS 24
 
@@ -160,7 +158,7 @@ static void scan_task(void *arg)
 
                 for (int i = 0; i < rows; i++) {
                     lv_obj_t *row = ui_row_card(s_list_wifi, 52);
-                    lv_obj_add_flag(row, LV_OBJ_FLAG_CLICKABLE);
+                    ui_obj_clickable(row, true);
                     lv_obj_add_event_cb(row, row_ap_cb, LV_EVENT_CLICKED, s_row_ssid[i]);
 
                     lv_obj_t *name = ui_label(row, s_row_ssid[i], &ui_font_18, UI_COL_TEXT);

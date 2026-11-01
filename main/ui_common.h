@@ -29,6 +29,37 @@ LV_FONT_DECLARE(ui_font_18);
 #define UI_W 480
 #define UI_H 480
 
+/*
+ * LVGL 9.6 起把 lv_obj_add_flag() / lv_obj_remove_flag() 标成 deprecated，
+ * 改成"一个 flag 一个专用 setter"。这里包一层：新版本走 setter、老版本退回
+ * flag API，两边都不产生弃用警告，也不用把版本判断散到每个界面文件里。
+ */
+static inline void ui_obj_scrollable(lv_obj_t *obj, bool en)
+{
+#if LV_VERSION_CHECK(9, 6, 0)
+    lv_obj_set_scrollable(obj, en);
+#else
+    if (en) {
+        lv_obj_add_flag(obj, LV_OBJ_FLAG_SCROLLABLE);
+    } else {
+        lv_obj_remove_flag(obj, LV_OBJ_FLAG_SCROLLABLE);
+    }
+#endif
+}
+
+static inline void ui_obj_clickable(lv_obj_t *obj, bool en)
+{
+#if LV_VERSION_CHECK(9, 6, 0)
+    lv_obj_set_clickable(obj, en);
+#else
+    if (en) {
+        lv_obj_add_flag(obj, LV_OBJ_FLAG_CLICKABLE);
+    } else {
+        lv_obj_remove_flag(obj, LV_OBJ_FLAG_CLICKABLE);
+    }
+#endif
+}
+
 /** @brief 一块干净的黑色屏幕（自动套上底色、关滚动）。 */
 lv_obj_t *ui_screen_new(void);
 

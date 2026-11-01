@@ -57,7 +57,7 @@ lv_obj_t *ui_screen_new(void)
     lv_obj_set_style_bg_opa(scr, LV_OPA_COVER, 0);
     lv_obj_set_style_pad_all(scr, 0, 0);
     lv_obj_set_style_border_width(scr, 0, 0);
-    lv_obj_remove_flag(scr, LV_OBJ_FLAG_SCROLLABLE);
+    ui_obj_scrollable(scr, false);
     return scr;
 }
 
@@ -134,7 +134,7 @@ lv_obj_t *ui_row_card(lv_obj_t *parent, int height)
     lv_obj_set_style_radius(row, 12, 0);
     lv_obj_set_style_border_width(row, 0, 0);
     lv_obj_set_style_pad_all(row, 8, 0);
-    lv_obj_remove_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+    ui_obj_scrollable(row, false);
     return row;
 }
 
@@ -167,8 +167,8 @@ void ui_toast(const char *msg)
     lv_obj_set_style_pad_ver(box, 8, 0);
     lv_obj_set_size(box, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
     lv_obj_align(box, LV_ALIGN_BOTTOM_MID, 0, -92);
-    lv_obj_remove_flag(box, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_remove_flag(box, LV_OBJ_FLAG_CLICKABLE);
+    ui_obj_scrollable(box, false);
+    ui_obj_clickable(box, false);
 
     lv_obj_t *l = ui_label(box, msg, &ui_font_18, UI_COL_BG);
     lv_obj_center(l);
