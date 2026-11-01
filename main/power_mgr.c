@@ -184,3 +184,8 @@ bool power_mgr_screen_is_on(void)
 {
     return s_screen_on;
 }
+
+bool power_mgr_is_low_power(void)
+{
+    return s_low_power;
+}

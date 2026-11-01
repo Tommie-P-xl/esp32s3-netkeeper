@@ -4,6 +4,7 @@
 #include <string.h>
 
 #include "app_config.h"
+#include "batt_mgr.h"
 #include "db.h"
 #include "esp_log.h"
 #include "esp_timer.h"
@@ -29,6 +30,7 @@ typedef struct {
     lv_obj_t *v_uptime;
     lv_obj_t *v_code;      /* 网页验证码 */
     lv_obj_t *v_code_ttl;  /* 验证码倒计时 */
+    lv_obj_t *v_bat;       /* 电池：插了电池才显示，没插整行隐藏 */
     lv_obj_t *msg;
 } ui_refs_t;
 
@@ -185,6 +187,39 @@ static void ui_timer_cb(lv_timer_t *t)
         char buf[16];
         fmt_dur(buf, sizeof(buf), (now - st.boot_ms) / 1000);
         lv_label_set_text(s_ui.v_uptime, buf);
+    }
+
+    /* 电池：没插电池整行不显示；插着 USB 只报百分比 + 充电状态（不估续航） */
+    {
+        batt_info_t bat;
+        batt_mgr_get(&bat);
+
+        if (!bat.present) {
+            ui_obj_hidden(s_ui.v_bat, true);
+        } else {
+            char buf[40];
+            if (bat.usb) {
+                snprintf(buf, sizeof(buf), "电池 %d%% · %s", bat.pct,
+                         bat.full ? "已充满" : "充电中");
+                lv_obj_set_style_text_color(s_ui.v_bat, UI_COL_GREEN, 0);
+            } else {
+                const lv_color_t col = (bat.pct <= 15) ? UI_COL_RED : UI_COL_SKY;
+                if (bat.minutes_left < 0) {
+                    snprintf(buf, sizeof(buf), "电池 %d%%", bat.pct);
+                } else if (bat.minutes_left >= 60) {
+                    snprintf(buf, sizeof(buf), "电池 %d%% · %dh%02dm", bat.pct,
+                             bat.minutes_left / 60, bat.minutes_left % 60);
+                } else {
+                    snprintf(buf, sizeof(buf), "电池 %d%% · %dm", bat.pct, bat.minutes_left);
+                }
+                lv_obj_set_style_text_color(s_ui.v_bat, col, 0);
+            }
+            /* 文本没变就别刷，否则每次 tick 都会触发一次重绘 */
+            if (strcmp(lv_label_get_text(s_ui.v_bat), buf) != 0) {
+                lv_label_set_text(s_ui.v_bat, buf);
+            }
+            ui_obj_hidden(s_ui.v_bat, false);
+        }
     }
 
     /* 网页验证码：5 分钟换一次，防同网段的人误改配置 */
@@ -426,6 +461,15 @@ void ui_create(lv_display_t *disp)
 
     s_ui.state_cn = ui_label(card, "启动中", &ui_font_18, UI_COL_MUTED);
     lv_obj_set_pos(s_ui.state_cn, 72, 78);
+
+    /* ---------------- 电池（卡左下） ----------------
+     * 没插电池时整行隐藏；插着 USB 只显示百分比+充电状态，不估续航。
+     * 位置在状态中文下面，宽 178 px，够放「电池 100% · 充电中」。 */
+    s_ui.v_bat = ui_label(card, "", &ui_font_18, UI_COL_SKY);
+    lv_obj_set_pos(s_ui.v_bat, 72, 102);
+    lv_obj_set_width(s_ui.v_bat, 180);
+    lv_label_set_long_mode(s_ui.v_bat, LV_LABEL_LONG_CLIP);
+    ui_obj_hidden(s_ui.v_bat, true);
 
     /* ---------------- 网页验证码（卡右侧） ---------------- */
     /* 中文必须走 ui_font_18，montserrat 没有汉字字形（会画成方框） */

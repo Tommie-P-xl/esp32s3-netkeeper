@@ -53,6 +53,13 @@ esp_err_t power_mgr_start(void);
  */
 bool power_mgr_screen_is_on(void);
 
+/**
+ * @brief Whether the CPU has been dropped to the idle frequency.
+ *
+ * The battery estimator uses this to pick a lower discharge current.
+ */
+bool power_mgr_is_low_power(void);
+
 #ifdef __cplusplus
 }
 #endif

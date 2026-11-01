@@ -1,13 +1,58 @@
-# portal_guard · 校园网守护
+<div align="center">
 
-把一块 **ESP32-S3 触摸屏小板**变成校园网（SRun Portal）自动认证器：
+# esp32s3-netkeeper
 
-> 检测外网 → 掉线自动重新认证 → 5 分钟轮询 → 屏幕上看得见状态。
+**把一块 ESP32-S3 触摸屏小板，变成会自己登录校园网的网守护**
+
+检测外网 → 掉线自动重认证 → 5 分钟轮询 → 屏幕上看得见状态
+
+[![License](https://img.shields.io/badge/License-MIT-3DA639.svg?style=flat-square)](LICENSE)
+[![ESP-IDF](https://img.shields.io/badge/ESP--IDF-v6.1-E7352C.svg?style=flat-square&logo=espressif&logoColor=white)](https://github.com/espressif/esp-idf)
+[![LVGL](https://img.shields.io/badge/LVGL-9.6-2C3E50.svg?style=flat-square)](https://lvgl.io)
+[![Platform](https://img.shields.io/badge/ESP32--S3-N16R8-8E44AD.svg?style=flat-square)](https://www.espressif.com/)
+[![Board](https://img.shields.io/badge/Board-AMOLED%202.16-E67E22.svg?style=flat-square)](https://www.waveshare.com/)
+[![Protocol](https://img.shields.io/badge/Portal-SRun%20%2F%20%E6%B7%B1%E6%BE%9C-1ABC9C.svg?style=flat-square)](#实现细节教学向)
+
+</div>
 
 面向 **SRun Portal**（国内高校最常见的深澜认证系统）。移植到别的 Portal 系统
-（Dr.COM、华为等）需要替换 `main/srun_port.c` 的登录流程。
+（Dr.COM、华为等）需要替换 `main/srun_port.c` 的登录流程，
+细节见[第 15 节](#15-想换成别的-portal-系统drcom--华为--锐捷)。
 
----
+> [!NOTE]
+> 一块板子 = 一个不用管的网守护。第一次配网在屏幕上点两下，之后断电、换网、掉线都自己恢复；
+> 配置同时存在 Flash 和 SD 卡，丢了哪一份都能救回来。
+
+## 目录
+
+- [界面预览](#界面预览)
+- [支持硬件](#支持硬件)
+- [功能](#功能)
+- [编译与烧录](#编译与烧录)
+- [配置存在哪、谁优先](#配置存在哪谁优先)
+- [屏幕操作](#屏幕操作)
+- [网页配置](#网页配置)
+- [目录结构](#目录结构)
+- [电池与功耗](#电池与功耗)
+- [排错](#排错)
+- [已知限制](#已知限制)
+- [实现细节（教学向）](#实现细节教学向)
+  - [1. 整体形状](#1-整体形状)
+  - [2. 任务与线程模型](#2-任务与线程模型)
+  - [3. 启动顺序（`app_main.c`）](#3-启动顺序app_mainc)
+  - [4. 网络守护主循环（`net_guard.c`）](#4-网络守护主循环net_guardc)
+  - [5. 外网探测：怎么判断有没有网、Portal 在哪（`srun_port.c`）](#5-外网探测怎么判断有没有网portal-在哪srun_portc)
+  - [6. SRun 认证算法：三个字段是怎么算出来的（`srun_crypto.c`）](#6-srun-认证算法三个字段是怎么算出来的srun_cryptoc)
+  - [7. 登录请求与响应判定（`srun_port.c`）](#7-登录请求与响应判定srun_portc)
+  - [8. 配置库：一份数据，两处存储（`db.c`）](#8-配置库一份数据两处存储dbc)
+  - [9. 局域网配置面板（`web.c` + `index.html`）](#9-局域网配置面板webc--indexhtml)
+  - [10. UI：一条线程、一把锁、一套排版规则（`ui.c` / `ui_common.c` / `ui_setup.c`）](#10-ui一条线程一把锁一套排版规则uic--ui_commonc--ui_setupc)
+  - [11. 电源管理（`power_mgr.c`）](#11-电源管理power_mgrc)
+  - [12. 电池状态（`batt_mgr.c` + AXP2101）](#12-电池状态batt_mgrc--axp2101)
+  - [13. 构建期配置（`sdkconfig.defaults` 里几个非默认项）](#13-构建期配置sdkconfigdefaults-里几个非默认项)
+  - [14. 踩过的坑（按"症状 → 根因"记）](#14-踩过的坑按症状--根因记)
+  - [15. 想换成别的 Portal 系统（Dr.COM / 华为 / 锐捷）](#15-想换成别的-portal-系统drcom--华为--锐捷)
+- [许可](#许可)
 
 ## 界面预览
 
@@ -23,8 +68,10 @@
 |---|---|
 | ![添加账号](docs/images/05_add.png) | ![网页配置](docs/images/06_web.png) |
 
-> 设备截图取自屏幕显存原分辨率 480×480。图中的 WiFi 名称、认证账号已做像素化/涂除处理，
+> [!NOTE]
+> 设备截图取自屏幕显存原分辨率 480×480。图中的 WiFi 名称、认证账号已做像素化 / 涂除处理，
 > 网页面板截图为纯示例数据（`ExampleWiFi` / `10000000000`），均非真实信息。
+> 主页状态卡里的电量这一行只在插了电池时出现（截图时插着 USB，所以显示「充电中」）。
 
 ---
 
@@ -35,6 +82,7 @@
 | 板子 | [Waveshare ESP32-S3-Touch-AMOLED-2.16](https://www.waveshare.com/)（ESP32-S3 N16R8） |
 | 屏幕 | CO5300 480×480 AMOLED（QSPI）+ CST9217 触摸 |
 | 存储 | 片上 NVS（必需）+ microSD（可选，1-bit SDMMC） |
+| 电源 | AXP2101（I2C 0x34）：电池电压 / USB 在位 / 充放电状态 |
 | 框架 | ESP-IDF **v6.1** |
 
 换板子的话，只需要替换 `main/power_mgr.c` 里的显示/背光调用和
@@ -59,6 +107,9 @@
 - **自愈**：目标网络连不上会自动回退到上次成功的、或库里其它网络，
   不会因为填错一个 SSID 就把板子锁死。
 - **省电**：10 秒无触摸熄屏，再 60 秒把 CPU 降到 80 MHz；触摸即亮。
+- **电池状态**：插了电池就在状态卡里显示电量百分比；**用电池供电**时再给一条
+  「预计还能用多久」（按当前亮屏/降频状态估算），**插着 USB 充电**时只显示电量和
+  「充电中 / 已充满」、不估续航；**没插电池整行不显示**。
 
 ---
 
@@ -76,9 +127,10 @@
 ```
 
 两个脚本都用 `$PSScriptRoot` 定位工程目录，放在任何路径下都能用；产物在
-`build/portal_guard.bin`。首次编译时组件管理器会按 `main/idf_component.yml`
+`build/esp32s3_netkeeper.bin`。首次编译时组件管理器会按 `main/idf_component.yml`
 自动拉取 LVGL 与 BSP 到 `managed_components/`（不入库）。
 
+> [!WARNING]
 > **flash-mode 必须是 `dio`**。这个板子用 `qio` 烧录后 ROM 会在第一段加载后挂死，
 > 表现为 TG0WDT 复位循环、串口一个字都看不到。`flash.ps1` 里已经写死 dio。
 
@@ -209,6 +261,7 @@ main/
   http_util.{c,h}   极简 HTTP GET（能抓 Location）
   web.{c,h}         局域网配置面板 + JSON API + 验证码鉴权
   sys_time.{c,h}    SNTP 校时 + 系统时间
+  batt_mgr.{c,h}    电池：AXP2101 读电压/充放电状态，按功耗模型估续航
   ui.c              主界面
   ui_setup.c        选网 / 输密码 / 账号管理
   ui_common.{c,h}   配色、字体、按钮工厂、顶部时钟
@@ -223,8 +276,9 @@ tools/
   fontgen/          lv_font_conv 生成 ui_font_18.c（node gen.js）
 ```
 
+> [!TIP]
 > 抓图脚本会把「短行补黑」。串口没有流控，某一行可能少几十个像素，
-> 而 PNG 要求每行定长——少一行会让解码器从这里开始错位，**整张图下半截全黑**，
+> 而 PNG 要求每行定长——少一行会让解码器从这里开始错位、**整张图下半截全黑**，
 > 看着像截图被裁掉了。`fb2png.py` / `mask_dump.py` 都会补齐并打印 `padded N short row(s)`。
 
 改界面文案后必须重新生成字体（LVGL 自带 CJK 字体缺「网/认/证/检/测」等简体字）：
@@ -242,7 +296,28 @@ copy ui_font_18.c ..\..\main\ui_font_18.c
 
 ---
 
-## 电池供电
+## 电池与功耗
+
+### 电量显示
+
+插上 MX1.25 锂电后，主界面状态卡左下角会自动多出一行（**没插电池整行不显示**）：
+
+| 场景 | 显示 |
+|---|---|
+| 电池供电（拔了 USB） | `电池 62% · 3h20m` —— 剩下的百分比 + 预计还能用多久 |
+| USB 在位、正在充电 | `电池 87% · 充电中` —— 只报电量，**不估续航**（充电时电流方向相反，估算没有意义） |
+| 充满、USB 仍在 | `电池 100% · 已充满` |
+| 没插电池 | 不显示 |
+
+续航是按**当前功耗状态**估的：亮屏约 120 mA、熄屏约 45 mA、熄屏降频约 28 mA。
+AXP2101 没有电池电流 ADC，所以这是模型估算而不是实测——`APP_BATTERY_MAH`
+（默认 1000 mAh）要按你的实际电池改，三个电流常量见
+[第 12 节](#12-电池状态batt_mgrc--axp2101)。
+
+同一份数据也可以通过网页接口读：
+`GET /api/state` 里的 `bat_present` / `bat_pct` / `bat_mv` / `bat_usb` / `bat_charging` / `bat_min`。
+
+### 省电策略
 
 默认策略是「熄屏 + CPU 降频到 80 MHz」，约 25–30 mA，好处是串口一直可用。
 
@@ -266,6 +341,9 @@ AMOLED 亮度对功耗影响很大，`APP_BRIGHTNESS` 调到 60 左右通常够�
 | 网页提示需要验证码 | 屏幕右上角有 6 位验证码，输入后解锁；连错 5 次锁 60 秒 |
 | 时间显示 `--:--` | 还没联网校时，联网后自动同步 |
 | 认证一直失败 | 账号密码错；或 Portal 换了域名，试 `APP_PORTAL_DOMAIN "@cmcc"` |
+| 电池那一行不显示 | 没插电池；或 AXP2101 没应答（串口搜 `AXP2101 not responding`） |
+| 电量显示虚高、一拔线就掉一截 | 充电时 VBAT 被抬高，调大 `APP_BAT_CHG_OFFSET_MV` |
+| 续航估计不准 | `APP_BATTERY_MAH` 和实际电池不符；三个 `APP_BAT_CUR_*_MA` 要按自己的板子重估 |
 | 卡里的配置没生效 | 格式不对（看 `[SSID]` 段和 `account=用户\|密码`），或超过 4000 字节 |
 
 ---
@@ -289,17 +367,20 @@ AMOLED 亮度对功耗影响很大，`APP_BRIGHTNESS` 调到 60 左右通常够�
 整块板子只有一件事要保证：**外网一直是通的**。围绕这一件事分成四个平级的角色，
 互相之间只通过「配置库」和「状态快照」耦合，谁挂了都不影响别人活着：
 
-```
-       ┌──────────────┐   读配置    ┌──────────────┐
-       │   net_guard  │◄───────────►│     db       │◄──── SD 卡 /portal/net.cfg
-       │  守护任务     │             │  NVS + SD    │
-       └──────┬───────┘             └──────▲───────┘
-              │ 状态快照                   │ 增删改
-              ▼                            │
-       ┌──────────────┐             ┌──────┴───────┐
-       │   ui (LVGL)  │             │     web      │◄──── 手机/电脑浏览器
-       │  屏幕 + 触摸   │◄────────────┤  httpd + 鉴权 │
-       └──────────────┘   同一份数据  └──────────────┘
+```mermaid
+flowchart LR
+    SD[("SD 卡<br/>/portal/net.cfg")]
+    DB["db<br/>NVS + SD 双写"]
+    NG["net_guard<br/>守护任务"]
+    UI["ui<br/>LVGL 单任务"]
+    WEB["web<br/>httpd + 验证码鉴权"]
+
+    UI <-->|"读写配置"| DB
+    WEB <-->|"增删改"| DB
+    DB <-->|"镜像"| SD
+    NG <-->|"读配置"| DB
+    NG -->|"状态快照"| UI
+    NG -->|"状态快照"| WEB
 ```
 
 三条设计原则贯穿全项目：
@@ -562,7 +643,8 @@ bool ui_lock(int timeout_ms) {
 }
 ```
 
-> ⚠️ **这个项目耗时最久的 bug 就在这里**。Waveshare BSP 的
+> [!CAUTION]
+> **这个项目耗时最久的 bug 就在这里**。Waveshare BSP 的
 > `bool bsp_display_lock()` 直接 `return esp_lv_adapter_lock()`，
 > 而后者返回 `esp_err_t`，`ESP_OK == 0`——转成 `bool` 后**成功变成 false**。
 > 于是 `if (bsp_display_lock(2000)) { ... }` 在**拿到锁的时候跳过整个临界区**，
@@ -616,7 +698,57 @@ bool ui_lock(int timeout_ms) {
 因为 CST9217 的 INT 是脉冲，一次性中断容易在 LVGL 忙的时候丢掉；
 10 ms 轮询在 480×480 上完全感觉不到延迟，代码也简单。
 
-### 12. 构建期配置（`sdkconfig.defaults` 里几个非默认项）
+### 12. 电池状态（`batt_mgr.c` + AXP2101）
+
+三件事：**判断有没有电池**、**算电量**、**估续航**。前两件是读数，第三件是模型——
+因为 AXP2101 **没有电池电流 ADC**（它只有 VBAT/VBUS/VSYS 电压和芯片温度），
+拿不到实测放电电流，所以"还能用多久"只能是估算。
+
+寄存器（datasheet 6.13，充电/放电各 dump 一次整表对比确认过）：
+
+| 寄存器 | 含义 |
+|---|---|
+| `0x00` status1 | bit5 = VBUS good（USB 在位） |
+| `0x01` status2 | bit[7:5] 充电状态：0 待机 / 1 充电中 / 2 放电 / 3 充电完成 |
+| `0x34` + `0x35` | VBAT，14 位（高 6 位 + 低 8 位），单位 mV |
+| `0xA4` | E-Gauge 电量百分比（本板没做电池标定，只用于对照，**不采信**） |
+
+**判断"有没有插电池"**：只看电压。VBAT ≥ 3000 mV 认为有电池；没电池时 BAT 脚悬空，
+ADC 读数接近 0。比"检测电池 NTC"之类的方案省事，且误判率很低。
+
+**电量**：分段线性查表（3.30 V→0%，4.15 V→100%）。有两个刻意的处理：
+
+- 带负载时电压会塌，所以曲线整体取得保守（3.75 V 只算 45%，而不是常见的 55–60%）；
+- **充电时 VBAT 会被抬高**（线损 + 极化），查表前先减 `APP_BAT_CHG_OFFSET_MV`（40 mV），
+  否则充着电会显示 95% 甚至 100%，一拔线就掉到 80%。
+
+**续航**：`剩余容量 / 当前典型电流 × 60`，三个电流档位按工作状态取：
+
+| 状态 | 电流（`app_config.h`） |
+|---|---|
+| 亮屏 + 240 MHz + WiFi | `APP_BAT_CUR_SCREEN_ON_MA` = 120 mA |
+| 熄屏，CPU 仍 240 MHz | `APP_BAT_CUR_IDLE_MA` = 45 mA |
+| 熄屏 + 降频 80 MHz | `APP_BAT_CUR_IDLE_LOW_MA` = 28 mA |
+
+容量只有 `APP_BATTERY_MAH` 一个参数要按实物改（默认 1000 mAh）。换屏、改亮度、
+加外设之后这三个电流值会偏，需要重新估——所以它显示的是"约 XhYYm"，不是精确值。
+
+**显示规则**（`ui.c` 的电池分支，位置在状态卡左下角）：
+
+| 情形 | 显示 |
+|---|---|
+| 没插电池 | 整行隐藏（`ui_obj_hidden`） |
+| 有电池 + USB 在位 + `status2[7:5]=1` | `电池 87% · 充电中`（绿色，不给续航） |
+| 有电池 + USB 在位 + `=3` | `电池 100% · 已充满`（绿色，不给续航） |
+| 有电池 + 没 USB | `电池 62% · 3h20m`（≤15% 转红色） |
+
+为什么不给充电中估续航：充电时电流方向是相反的，用放电模型算出来的数字没有意义。
+
+一个实现细节：这个标签**只有文本真的变化时才 `lv_label_set_text()`**。状态定时器
+500 ms 跑一次，如果每次都无条件 set，LVGL 会每 500 ms 重绘一次这块区域，
+白白多耗电——对一块电池供电的表来说这就是"功能自己吃掉了自己的续航"。
+
+### 13. 构建期配置（`sdkconfig.defaults` 里几个非默认项）
 
 | 配置 | 为什么 |
 |---|---|
@@ -629,7 +761,7 @@ bool ui_lock(int timeout_ms) {
 | `CONFIG_MBEDTLS_MD5_C` / `SHA1_C` | SRun 算法要 MD5 和 SHA1 |
 | `CONFIG_ESP_MAIN_TASK_STACK_SIZE=6144` | `app_main` 里 `db_dump()` 打日志会吃掉不少栈 |
 
-### 13. 踩过的坑（按"症状 → 根因"记）
+### 14. 踩过的坑（按"症状 → 根因"记）
 
 | 症状 | 根因 | 修法 |
 |---|---|---|
@@ -644,7 +776,7 @@ bool ui_lock(int timeout_ms) {
 | 界面文字被键盘压住 | 键盘固定占底部 250 px | 输入控件与按钮排在 y<230 |
 | 标题太长压住时钟 | 把动态 SSID 拼进标题 | 标题固定文案 + SSID 单独一行 + 省略号 |
 
-### 14. 想换成别的 Portal 系统（Dr.COM / 华为 / 锐捷）
+### 15. 想换成别的 Portal 系统（Dr.COM / 华为 / 锐捷）
 
 改动被刻意收在一个文件里：
 

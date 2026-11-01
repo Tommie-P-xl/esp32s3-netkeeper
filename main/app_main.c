@@ -12,6 +12,7 @@
 #include <stdio.h>
 
 #include "app_config.h"
+#include "batt_mgr.h"
 #include "db.h"
 #include "esp_err.h"
 #include "esp_event.h"
@@ -85,6 +86,10 @@ void app_main(void)
         ui_unlock();
 
         power_mgr_start();
+
+        /* 电池状态：借用 BSP 已经建好的 I2C 总线读 AXP2101。
+         * 失败（板子没 PMIC / 总线异常）不影响主流程，界面自己会把电池行藏掉。 */
+        batt_mgr_start();
     } else {
         ESP_LOGE(TAG, "display init failed, UI disabled");
     }

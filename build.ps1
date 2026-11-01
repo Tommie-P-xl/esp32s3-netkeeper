@@ -1,4 +1,4 @@
-# Build portal_guard from the command line.
+# Build esp32s3-netkeeper from the command line.
 #
 # Requires an ESP-IDF environment: either run "export.ps1" from your IDF install
 # first, or set IDF_PATH + IDF_PYTHON_ENV_PATH yourself.

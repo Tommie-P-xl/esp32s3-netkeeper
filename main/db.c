@@ -137,7 +137,7 @@ static bool serialize_locked(void)
 {
     sbuf_t sb = {.buf = s_text, .cap = sizeof(s_text), .len = 0, .overflow = false};
 
-    sb_put(&sb, "# portal_guard 配置（可以直接用读卡器改，改完插回板子重载）\n"
+    sb_put(&sb, "# esp32s3-netkeeper 配置（可以直接用读卡器改，改完插回板子重载）\n"
                 "#\n"
                 "# [general]  active=  开机自动连的 WiFi，也是守护目标\n"
                 "# [SSID]     wifi=    WiFi 密码，开放网络留空\n"

@@ -9,4 +9,4 @@ set(EXTRA_COMPONENT_DIRS
     )
 
 add_compile_options(-Wno-format)
-project(portal_guard)
+project(esp32s3_netkeeper)

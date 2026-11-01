@@ -1,4 +1,4 @@
-# Flash portal_guard and start it running.
+# Flash esp32s3-netkeeper and start it running.
 #
 # usage:  .\flash.ps1 COM6
 #
@@ -43,7 +43,7 @@ if (Test-Path $log) { Remove-Item $log -Force }
     write-flash --flash-mode dio --flash-freq 80m --flash-size 16MB `
     0x0     "$proj\build\bootloader\bootloader.bin" `
     0x8000  "$proj\build\partition_table\partition-table.bin" `
-    0x10000 "$proj\build\portal_guard.bin" *>> $log
+    0x10000 "$proj\build\esp32s3_netkeeper.bin" *>> $log
 $w = $LASTEXITCODE
 
 if ($w -eq 0) {

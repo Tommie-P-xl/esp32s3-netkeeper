@@ -14,6 +14,7 @@ idf_component_register(
         srun_port.c
         sys_time.c
         http_util.c
+        batt_mgr.c
     INCLUDE_DIRS .
     # 配置页构建时直接嵌进固件，板上不需要文件系统
     EMBED_FILES index.html

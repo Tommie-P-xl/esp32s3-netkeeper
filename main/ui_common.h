@@ -60,6 +60,19 @@ static inline void ui_obj_clickable(lv_obj_t *obj, bool en)
 #endif
 }
 
+static inline void ui_obj_hidden(lv_obj_t *obj, bool en)
+{
+#if LV_VERSION_CHECK(9, 6, 0)
+    lv_obj_set_hidden(obj, en);
+#else
+    if (en) {
+        lv_obj_add_flag(obj, LV_OBJ_FLAG_HIDDEN);
+    } else {
+        lv_obj_remove_flag(obj, LV_OBJ_FLAG_HIDDEN);
+    }
+#endif
+}
+
 /** @brief 一块干净的黑色屏幕（自动套上底色、关滚动）。 */
 lv_obj_t *ui_screen_new(void);
 
