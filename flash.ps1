@@ -1,10 +1,18 @@
-# Flash portal_guard and reboot the chip.
-#
-# The board's EN pin is not wired to USB RTS, but this chip routes its console and
-# reset through the USB-Serial/JTAG peripheral, so esptool's usb-reset / hard-reset
-# sequences work and no physical power-cycle is needed.
+# Flash portal_guard and start it running.
 #
 # usage:  .\flash.ps1 COM6
+#
+# Reset notes (learned the hard way on this board):
+#   * EN is NOT wired to USB RTS, so "--after hard-reset" is a no-op here.
+#     A flashed chip stays in the ROM download mode and the screen never lights
+#     up, which looks exactly like "firmware is broken".
+#   * "--after watchdog-reset" IS a CPU level reset and does boot from flash,
+#     but esptool loses the serial port mid-command and exits non-zero, which
+#     would make a successful flash look failed.
+#   * So: write with no-reset (exit code reflects only the write), then fire a
+#     best-effort watchdog reset in a second command and ignore its status.
+#   * If the console still stays silent afterwards, long-press PWR once: that
+#     is a full PMIC power cycle and always works.
 #
 # ASCII only: executed by Windows PowerShell 5.1 with an ANSI code page.
 $ErrorActionPreference = "Continue"
@@ -37,6 +45,14 @@ if (Test-Path $log) { Remove-Item $log -Force }
     0x8000  "$proj\build\partition_table\partition-table.bin" `
     0x10000 "$proj\build\portal_guard.bin" *>> $log
 $w = $LASTEXITCODE
+
+if ($w -eq 0) {
+    "== reset ==" | Out-File $log -Append -Encoding ascii
+    # Best effort: this exits non-zero because the port disappears while the
+    # chip resets. The flash already succeeded, so do not propagate the code.
+    & $py -m esptool --chip esp32s3 -p $port --before usb-reset --after watchdog-reset `
+        chip_id *>> $log
+}
 
 "$w|$port" | Write-Host
 exit $w
