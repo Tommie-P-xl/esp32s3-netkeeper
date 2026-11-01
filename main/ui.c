@@ -292,24 +292,17 @@ static void snapshot_probe(lv_timer_t *t)
  * 只在 APP_UI_DUMP_FB=1 时编译。
  */
 #if APP_UI_DUMP_FB
-static void dump_fb_now(void)
+/* 串口发送部分单独跑在任务里。
+ *
+ * 为什么拆：整屏 480x480 要传 ~1MB，按 USB CDC 的实际吞吐要 90 秒以上。
+ * 如果直接在 lv_timer 回调里发，LVGL 任务会被占住这么久——表现就是界面冻住、
+ * 时钟和倒计时都不走、连熄屏都推迟（第一次抓 README 截图时就踩过）。
+ * 现在 LVGL 线程只做一次快照（几十毫秒），发送交给下面这个任务。 */
+static bool s_dump_busy;
+
+static void dump_writer_task(void *arg)
 {
-    ESP_LOGI(TAG, "dump framebuffer start");
-    /* 必须先建缓冲再自己清零：lv_snapshot_take() 不保证缓冲区初始化，
-     * 拿到的是未清零的堆内存（实测整屏 0xf7be），画出来的图完全是假的。 */
-    lv_draw_buf_t *snap =
-        lv_snapshot_create_draw_buf(lv_screen_active(), LV_COLOR_FORMAT_RGB565);
-    if (snap == NULL) {
-        ESP_LOGW(TAG, "snapshot buffer alloc failed");
-        return;
-    }
-    memset(snap->data, 0, snap->data_size);
-    if (lv_snapshot_take_to_draw_buf(lv_screen_active(), LV_COLOR_FORMAT_RGB565, snap) !=
-        LV_RESULT_OK) {
-        ESP_LOGW(TAG, "snapshot failed");
-        lv_draw_buf_destroy(snap);
-        return;
-    }
+    lv_draw_buf_t *snap = (lv_draw_buf_t *)arg;
 
     const uint16_t *px = (const uint16_t *)snap->data;
     const uint32_t stride = snap->header.stride / 2;
@@ -374,6 +367,48 @@ static void dump_fb_now(void)
     fflush(stdout);
 
     lv_draw_buf_destroy(snap);
+    s_dump_busy = false;
+    vTaskDelete(NULL);
+}
+
+/* 在 LVGL 线程里只做快照，几十毫秒就返回 */
+static void dump_fb_now(void)
+{
+    if (s_dump_busy) {
+        ESP_LOGW(TAG, "previous dump still running, skip");
+        return;
+    }
+
+    /* 抓图前先逼一次刷新：快照会触发一次离屏渲染，如果此时面板的 QSPI 刷新
+     * 还在传输中，两层 SPI 事务会撞在一起，实测偶发
+     * `assert failed: spi_device_release_bus`（板子直接复位，一整个抓图序列报废）。
+     * lv_refr_now + 短暂等待能把在途的刷新收干净，之后再快照。 */
+    lv_refr_now(NULL);
+    vTaskDelay(pdMS_TO_TICKS(30));
+
+    /* 必须先建缓冲再自己清零：lv_snapshot_take() 不保证缓冲区初始化，
+     * 拿到的是未清零的堆内存（实测整屏 0xf7be），画出来的图完全是假的。 */
+    lv_draw_buf_t *snap =
+        lv_snapshot_create_draw_buf(lv_screen_active(), LV_COLOR_FORMAT_RGB565);
+    if (snap == NULL) {
+        ESP_LOGW(TAG, "snapshot buffer alloc failed");
+        return;
+    }
+    memset(snap->data, 0, snap->data_size);
+    if (lv_snapshot_take_to_draw_buf(lv_screen_active(), LV_COLOR_FORMAT_RGB565, snap) !=
+        LV_RESULT_OK) {
+        ESP_LOGW(TAG, "snapshot failed");
+        lv_draw_buf_destroy(snap);
+        return;
+    }
+
+    ESP_LOGI(TAG, "dump framebuffer start");
+    s_dump_busy = true;
+    if (xTaskCreate(dump_writer_task, "fbdump", 4096, snap, 4, NULL) != pdPASS) {
+        ESP_LOGE(TAG, "dump task create failed");
+        s_dump_busy = false;
+        lv_draw_buf_destroy(snap);
+    }
 }
 
 static void dump_fb(lv_timer_t *t)
@@ -518,17 +553,20 @@ void ui_create(lv_display_t *disp)
     /* 单屏 dump 实测：240x240 约 30s，480x480 约 95s（串口吞吐限制）。
      * 间隔必须大于一次 dump 的耗时，否则切屏和 dump 的定时器会在同一轮里
      * 连着触发，dump 抓到的是还没重绘的旧画面。 */
-    lv_timer_create(dump_fb, 3000, NULL);          /* 1 主页 */
-    lv_timer_create(cap_open_wifi, 118000, NULL);
-    lv_timer_create(dump_fb, 121000, NULL);        /* 2 选网 */
-    lv_timer_create(cap_open_acct, 236000, NULL);
-    lv_timer_create(dump_fb, 239000, NULL);        /* 3 账户 */
-    lv_timer_create(cap_open_pass, 354000, NULL);
-    lv_timer_create(dump_fb, 357000, NULL);        /* 4 输密码 */
-    lv_timer_create(cap_open_add, 472000, NULL);
-    lv_timer_create(dump_fb, 475000, NULL);        /* 5 添加账号 */
+    /* 主页那张必须等联网 + SNTP 都完成再抓，否则拍出来是「LINKING / 未联网 /
+     * 运行时长 00:02」，当 README 首图完全不像个成品。30 秒足够连上 WiFi、
+     * 拿到 IP、认证成功，后面的间隔按单张 dump 约 95 秒排。 */
+    lv_timer_create(dump_fb, 30000, NULL);         /* 1 主页（已联网） */
+    lv_timer_create(cap_open_wifi, 145000, NULL);
+    lv_timer_create(dump_fb, 148000, NULL);        /* 2 选网 */
+    lv_timer_create(cap_open_acct, 263000, NULL);
+    lv_timer_create(dump_fb, 266000, NULL);        /* 3 账户 */
+    lv_timer_create(cap_open_pass, 381000, NULL);
+    lv_timer_create(dump_fb, 384000, NULL);        /* 4 输密码 */
+    lv_timer_create(cap_open_add, 499000, NULL);
+    lv_timer_create(dump_fb, 502000, NULL);        /* 5 添加账号 */
 #else
-    lv_timer_create(dump_fb, 3000, NULL);
+    lv_timer_create(dump_fb, 30000, NULL);
 #endif
 #endif
 
