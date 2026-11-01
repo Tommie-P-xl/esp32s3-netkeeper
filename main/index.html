@@ -1,0 +1,250 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>校园网守护 · 配置</title>
+<style>
+  :root{--bg:#f5f5f3;--card:#fff;--line:#e3e2dd;--text:#1c1c1a;--muted:#77756e;--ok:#1a7f4b;--warn:#a86400;--bad:#a32d2d}
+  *{box-sizing:border-box}
+  body{margin:0;padding:16px;background:var(--bg);color:var(--text);font:14px/1.6 system-ui,-apple-system,"Segoe UI","Microsoft YaHei",sans-serif}
+  .wrap{max-width:720px;margin:0 auto}
+  h1{font-size:17px;font-weight:500;margin:0 0 12px}
+  .card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:14px 16px;margin-bottom:12px}
+  .row{display:flex;justify-content:space-between;gap:12px;padding:4px 0;font-size:13px}
+  .row span:first-child{color:var(--muted);flex:none}
+  .row span:last-child{text-align:right;word-break:break-all}
+  .st{display:flex;align-items:center;gap:8px;font-size:16px;font-weight:500;margin-bottom:6px}
+  .dot{width:10px;height:10px;border-radius:50%;background:var(--muted);flex:none}
+  .ok .dot{background:var(--ok)} .warn .dot{background:var(--warn)} .bad .dot{background:var(--bad)}
+  .ok .dot,.ok .lbl{color:var(--ok)} .warn .lbl{color:var(--warn)} .bad .lbl{color:var(--bad)}
+  .lbl{font-weight:500}
+  button{font:inherit;border:1px solid var(--line);background:#fff;border-radius:8px;padding:6px 12px;cursor:pointer;color:var(--text)}
+  button:hover{border-color:#c9c7bf}
+  button.primary{background:#1c1c1a;color:#fff;border-color:#1c1c1a}
+  button.danger{color:var(--bad);border-color:#e8cfcf}
+  input{font:inherit;border:1px solid var(--line);border-radius:8px;padding:6px 10px;width:100%;background:#fff;color:var(--text)}
+  .net{border-top:1px solid var(--line);padding-top:10px;margin-top:10px}
+  .net:first-of-type{border-top:0;padding-top:0;margin-top:0}
+  .ssid{display:flex;justify-content:space-between;align-items:center;gap:8px;margin-bottom:6px}
+  .ssid b{font-weight:500}
+  .tag{font-size:12px;color:var(--muted);border:1px solid var(--line);border-radius:6px;padding:1px 6px;margin-left:6px}
+  .tag.on{color:var(--ok);border-color:#bfe0cd}
+  .acct{display:flex;justify-content:space-between;align-items:center;gap:8px;padding:4px 0;font-size:13px}
+  .acct .u{font-family:ui-monospace,Consolas,monospace}
+  .form{display:flex;gap:8px;margin-top:8px}
+  .form input{flex:1}
+  .hint{color:var(--muted);font-size:12px;margin-top:8px}
+  .empty{color:var(--muted);font-size:13px}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>校园网守护 · 配置</h1>
+
+  <div class="card" id="gate">
+    <div class="st"><span class="dot"></span><span class="lbl">需要验证码</span></div>
+    <p class="hint" style="margin:4px 0 10px">
+      用手机 / 电脑连<strong>板子同一个 WiFi</strong>，浏览器打开
+      <code id="gate_url">http://板子IP</code> 就能配置（网址显示在板子屏幕上）。
+      修改配置前，请输入板子屏幕上显示的 <strong>6 位验证码</strong>：
+    </p>
+    <div class="form">
+      <input id="gate_code" placeholder="6 位验证码" maxlength="6" inputmode="numeric"
+             style="max-width:220px;letter-spacing:4px">
+      <button class="primary" onclick="unlock()">解锁</button>
+    </div>
+    <div class="hint">验证码每 5 分钟自动更换；解锁后本页面持续有效，不受换码影响。</div>
+  </div>
+
+  <div class="card" id="status">
+    <div class="st"><span class="dot"></span><span class="lbl" id="stext">读取中…</span></div>
+    <div class="row"><span>当前 WiFi</span><span id="ssid">-</span></div>
+    <div class="row"><span>IP</span><span id="ip">-</span></div>
+    <div class="row"><span>认证账号</span><span id="acct">-</span></div>
+    <div class="row"><span>重新认证</span><span id="cnt">0 次</span></div>
+    <div class="row"><span>下次检测</span><span id="next">-</span></div>
+    <div class="row"><span>最近结果</span><span id="detail">-</span></div>
+    <div style="display:flex;gap:8px;margin-top:12px;flex-wrap:wrap">
+      <button class="primary" onclick="post('/api/check')">立即检测</button>
+      <button onclick="post('/api/reload')">重载 SD 配置</button>
+      <button onclick="if(confirm('用 SD 卡上的配置覆盖片上 Flash ?')) post('/api/restore')">从 SD 恢复</button>
+      <button onclick="lockNow()">锁定页面</button>
+    </div>
+    <div class="row" style="margin-top:8px"><span>存储</span><span id="store">-</span></div>
+  </div>
+
+  <div class="card">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px">
+      <b style="font-weight:500">网络与账号</b>
+      <button onclick="load()">刷新</button>
+    </div>
+    <div id="nets"></div>
+    <div class="form">
+      <input id="n_ssid" placeholder="WiFi 名称">
+      <input id="n_pass" placeholder="WiFi 密码（开放网络留空）">
+      <button onclick="addWifi()">添加</button>
+    </div>
+    <div class="hint">添加后会立刻尝试连接；连上之后再到对应的 WiFi 下面添认证账号。</div>
+  </div>
+
+  <div class="card">
+    <p class="hint" style="margin:0">
+      配置文件在 SD 卡 <code>/portal/net.cfg</code>，可以直接拿读卡器改。
+      本页所做的修改会立即写回该文件。
+    </p>
+  </div>
+</div>
+
+<script>
+var lastNets = [];
+var TOKEN = localStorage.getItem('pg_token') || '';
+
+document.getElementById('gate_url').textContent = location.origin;
+
+function setUnlocked(yes){
+  document.getElementById('gate').style.display = yes ? 'none' : '';
+}
+
+function unlock(){
+  var code = document.getElementById('gate_code').value.trim();
+  if(!code){ alert('请输入板子屏幕上的验证码'); return; }
+  fetch('/api/auth', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/x-www-form-urlencoded'},
+    body: 'code=' + encodeURIComponent(code)
+  }).then(function(r){ return r.json(); }).then(function(j){
+    if(j.ok && j.token){
+      TOKEN = j.token;
+      localStorage.setItem('pg_token', TOKEN);
+      setUnlocked(true);
+      load();
+    } else {
+      alert('解锁失败：' + (j.msg || '验证码错误'));
+    }
+  }).catch(function(e){ alert('请求失败：' + e); });
+}
+
+function fmt(ms){
+  if(!ms || ms < 0) return '--:--';
+  var s = Math.floor(ms/1000), m = Math.floor(s/60), h = Math.floor(m/60);
+  if(h > 0) return h + ':' + String(m%60).padStart(2,'0') + ':' + String(s%60).padStart(2,'0');
+  return String(m).padStart(2,'0') + ':' + String(s%60).padStart(2,'0');
+}
+function esc(s){
+  return String(s == null ? '' : s).replace(/[&<>"']/g, function(c){
+    return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c];
+  });
+}
+function body(o){
+  return Object.keys(o).map(function(k){
+    return encodeURIComponent(k) + '=' + encodeURIComponent(o[k] == null ? '' : o[k]);
+  }).join('&');
+}
+function post(url, data){
+  data = data || {};
+  data.token = TOKEN;
+  return fetch(url, {
+    method: 'POST',
+    headers: {'Content-Type': 'application/x-www-form-urlencoded'},
+    body: body(data)
+  }).then(function(r){ return r.json(); }).then(function(j){
+    if(j && j.need_auth){
+      setUnlocked(false);
+      alert(j.msg || '请先输入验证码解锁');
+      return j;
+    }
+    if(!j.ok) alert('操作失败：' + (j.msg || '未知错误'));
+    load();
+    return j;
+  }).catch(function(e){ alert('请求失败：' + e); });
+}
+
+function load(){
+  fetch('/api/state').then(function(r){ return r.json(); }).then(function(s){
+    var cls = s.state === 'ONLINE' ? 'ok' : (s.state === 'AUTH_FAILED' || s.state === 'WIFI_DOWN' || s.state === 'ERROR' ? 'bad' : 'warn');
+    document.getElementById('status').className = 'card ' + cls;
+    document.getElementById('stext').textContent = s.stext || s.state;
+    document.getElementById('ssid').textContent = s.ssid || '-';
+    document.getElementById('ip').textContent = s.ip || '-';
+    document.getElementById('acct').textContent = s.account || '-';
+    document.getElementById('cnt').textContent = s.auth_count + ' 次';
+    document.getElementById('next').textContent = fmt(s.next_in_ms);
+    document.getElementById('detail').textContent = s.detail || '-';
+    document.getElementById('store').textContent = s.sd ? 'Flash + SD 卡（SD 优先）' : '仅片上 Flash';
+    renderNets(s.nets || []);
+  }).catch(function(e){
+    /* 之前这里吞掉错误，页面永远停在「读取中」没有线索。常见原因：
+     * 浏览器/系统代理（Clash）拦了内网 IP —— 请把 192.168.* 加进代理直连名单。 */
+    document.getElementById('status').className = 'card bad';
+    document.getElementById('stext').textContent = '连接板子失败';
+    document.getElementById('detail').textContent = String(e && e.message || e);
+  });
+}
+
+function renderNets(nets){
+  lastNets = nets;
+  var host = document.getElementById('nets');
+  if(!nets.length){
+    host.innerHTML = '<div class="empty">还没有保存任何 WiFi。用下面的表单添加，或在板子的屏幕上配网。</div>';
+    return;
+  }
+  host.innerHTML = nets.map(function(n){
+    var isActive = n.active;
+    var accts = (n.accts || []).map(function(a){
+      var cur = a.user === n.current;
+      return '<div class="acct">' +
+        '<span class="u">' + esc(a.user) + (cur ? '<span class="tag on">使用中</span>' : '') + '</span>' +
+        '<span>' + (cur ? '' : '<button onclick="useAcct(\'' + esc(n.ssid) + '\',\'' + esc(a.user) + '\')">设为当前</button> ') +
+        '<button class="danger" onclick="delAcct(\'' + esc(n.ssid) + '\',\'' + esc(a.user) + '\')">删除</button></span>' +
+      '</div>';
+    }).join('');
+    return '<div class="net">' +
+      '<div class="ssid"><b>' + esc(n.ssid) + (isActive ? '<span class="tag on">当前网络</span>' : '') + '</b>' +
+        '<span>' + (isActive ? '' : '<button onclick="useWifi(\'' + esc(n.ssid) + '\')">切到此网</button> ') +
+        '<button class="danger" onclick="delWifi(\'' + esc(n.ssid) + '\')">删除</button></span></div>' +
+      (accts || '<div class="empty">这个 WiFi 下还没有认证账号</div>') +
+      '<div class="form">' +
+        '<input id="u_' + esc(n.ssid) + '" placeholder="校园网账号">' +
+        '<input id="p_' + esc(n.ssid) + '" placeholder="密码">' +
+        '<button onclick="addAcct(\'' + esc(n.ssid) + '\')">添加账号</button>' +
+      '</div>' +
+    '</div>';
+  }).join('');
+}
+
+function addWifi(){
+  var ssid = document.getElementById('n_ssid').value.trim();
+  var pass = document.getElementById('n_pass').value;
+  if(!ssid){ alert('请填写 WiFi 名称'); return; }
+  post('/api/wifi', {ssid: ssid, pass: pass});
+}
+function addAcct(ssid){
+  var u = document.getElementById('u_' + ssid).value.trim();
+  var p = document.getElementById('p_' + ssid).value;
+  if(!u){ alert('请填写账号'); return; }
+  post('/api/acct', {ssid: ssid, user: u, pass: p, use: 1});
+}
+function delAcct(ssid, user){
+  if(!confirm('删除账号 ' + user + ' ?')) return;
+  post('/api/remove', {type: 'acct', ssid: ssid, user: user});
+}
+function delWifi(ssid){
+  if(!confirm('删除网络 ' + ssid + ' 及其全部账号 ?')) return;
+  post('/api/remove', {type: 'wifi', ssid: ssid});
+}
+function useWifi(ssid){ post('/api/wifi', {ssid: ssid, pass: null, use: 1}); }
+function useAcct(ssid, user){ post('/api/use', {ssid: ssid, user: user}); }
+
+function lockNow(){
+  TOKEN = '';
+  localStorage.removeItem('pg_token');
+  setUnlocked(false);
+}
+
+load();
+if (TOKEN) setUnlocked(true); else setUnlocked(false);
+setInterval(load, 3000);
+</script>
+</body>
+</html>

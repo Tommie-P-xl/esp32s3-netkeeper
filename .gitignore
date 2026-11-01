@@ -1,0 +1,33 @@
+# ESP-IDF
+build/
+sdkconfig
+sdkconfig.old
+*.log
+*.bin
+*.elf
+*.map
+flash_rc.txt
+rc.txt
+
+# managed components are re-fetched by the component manager from the manifests
+managed_components/
+
+# font tooling: node_modules is installed locally; the generated .c is committed
+# (main/ui_font_18.c) so a fresh clone builds without running node at all.
+tools/fontgen/node_modules/
+tools/fontgen/ui_font_18.c
+
+# serial capture / framebuffer dumps produced by tools/*.py during debugging
+*.txt.tmp
+_dump_*.txt
+_full_*.txt
+_cap*.txt
+
+# IDE
+.vscode/
+.clangd
+.devcontainer/
+
+# OS
+Thumbs.db
+.DS_Store

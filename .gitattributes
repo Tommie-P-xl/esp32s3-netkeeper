@@ -1,0 +1,10 @@
+# Keep the tree LF so the sources look the same on every OS.
+* text=auto eol=lf
+
+# Windows scripts must keep CRLF: PowerShell 5.1 with an ANSI code page is
+# sensitive to how the file is laid out, and CRLF is what the ESP-IDF export
+# scripts produce.
+*.ps1 text eol=crlf
+
+*.png binary
+*.jpg binary
