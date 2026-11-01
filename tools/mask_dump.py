@@ -51,14 +51,28 @@ def load_dump(src):
         raise SystemExit("no FBDUMP header")
     w, h = int(m.group(1)), int(m.group(2))
     rows = []
+    short = 0
     for line in text.splitlines():
         if not re.match(r"R\d{3} ", line):
             continue
         hexpart = line[5:].strip()
+        # 偶尔会有日志插进某一行，把非十六进制字符剔掉再按 4 位切
+        hexpart = re.sub(r"[^0-9a-fA-F]", "", hexpart)
         row = []
-        for i in range(0, len(hexpart), 4):
+        for i in range(0, len(hexpart) - 3, 4):
             row.append(rgb565_to_rgb888(int(hexpart[i:i + 4], 16)))
+        # 串口没有流控，某一行可能少几个像素。PNG 要求每行定长，否则解码器
+        # 会从这一行开始错位、后面的内容整片变黑（看起来像截图被截断了）。
+        # 缺的部分按黑补：丢的总是行尾，那块基本都是背景。
+        if len(row) < w:
+            short += 1
+            row.extend([(0, 0, 0)] * (w - len(row)))
         rows.append(row[:w])
+    if short:
+        print("warn: padded %d short row(s) with black" % short)
+    if len(rows) != h:
+        print("warn: got %d/%d rows, missing ones left black" % (len(rows), h))
+        rows.extend([[(0, 0, 0)] * w for _ in range(h - len(rows))])
     return w, h, rows[:h]
 
 

@@ -213,6 +213,10 @@ tools/
   fontgen/          lv_font_conv 生成 ui_font_18.c（node gen.js）
 ```
 
+> 抓图脚本会把「短行补黑」。串口没有流控，某一行可能少几十个像素，
+> 而 PNG 要求每行定长——少一行会让解码器从这里开始错位，**整张图下半截全黑**，
+> 看着像截图被裁掉了。`fb2png.py` / `mask_dump.py` 都会补齐并打印 `padded N short row(s)`。
+
 改界面文案后必须重新生成字体（LVGL 自带 CJK 字体缺「网/认/证/检/测」等简体字）：
 
 ```powershell
