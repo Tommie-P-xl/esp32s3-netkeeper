@@ -1,6 +1,6 @@
 # Changelog
 
-本项目的版本变更记录。格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
+本项目的版本变更记录。格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/)，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
 实现细节与踩过的坑在 [README](README.md#实现细节教学向) / [踩坑记录](README.md#踩坑记录) 里，这里只记"哪个版本变了什么"。
@@ -9,7 +9,7 @@
 
 暂无。
 
-## [1.0.0] - 2026-11-02
+## 首个可用版本 - 2026-11-02
 
 首个可用版本：一块 ESP32-S3 触摸屏板 = 校园网（SRun）自动认证器。
 
@@ -27,7 +27,7 @@
 - **电池状态**：读 AXP2101 的 VBAT 与充放电状态位，显示电量百分比；放电时给续航估计
   （按亮屏/熄屏/降频三档电流估算），充电时只报电量。三档充电状态：`充电中` / `已充满` / `已接电源`。（`batt_mgr.c`）
 - **省电**：10 s 无触摸熄屏、再 60 s 降到 80 MHz，触摸即回；充电时同样生效。（`power_mgr.c`）
-- **CI**：push/PR 自动编译并上传 artifact，推 `v*` tag 自动发 Release（不附固件）。（`.github/workflows/ci.yml`）
+- **CI**：push/PR 自动编译并上传 artifact，推版本 tag 自动发布固件。（`.github/workflows/ci.yml`）
 
 ### 修复
 

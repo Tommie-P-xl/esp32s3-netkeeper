@@ -1,6 +1,5 @@
 {
   "name": "fontgen",
-  "version": "1.0.0",
   "description": "",
   "main": "gen.js",
   "scripts": {

@@ -1,7 +1,7 @@
 name: build
 
 # 每次 push 到 main / PR 都编译一遍（防止"本地能过、别人拉下来编不过"）；
-# 打 v* tag 时额外建一个 Release（只发源码和自动生成的说明，不挂二进制）。
+# 打与 version 文件一致的 v* tag 时发布固件。
 on:
   push:
     branches: [main]
@@ -23,6 +23,16 @@ jobs:
       options: --user root
     steps:
       - uses: actions/checkout@v4
+
+      - name: Validate project version
+        shell: bash
+        run: |
+          version=$(tr -d '\r\n' < version)
+          [[ "$version" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] || { echo "Invalid version file" >&2; exit 1; }
+          if [[ "$GITHUB_REF" == refs/tags/* && "$GITHUB_REF_NAME" != "v${version}" ]]; then
+            echo "Tag must match v${version} from the version file" >&2
+            exit 1
+          fi
 
       # 组件管理器要拉 LVGL 和 Waveshare 的 BSP，缓存能省下几分钟
       - name: Cache component manager
@@ -47,7 +57,20 @@ jobs:
           ls -l build/esp32s3_netkeeper.bin
           python3 -c "import os;print('app: %.2f MB' % (os.path.getsize('build/esp32s3_netkeeper.bin')/1048576))"
 
-      # 产物留在 Actions artifacts 里（按需求不挂到 Release 上）
+      - name: Verify firmware version
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          image = Path('build/esp32s3_netkeeper.bin').read_bytes()
+          expected = Path('version').read_text().strip()
+          if image[32:36] != bytes.fromhex('3254cdab'):
+              raise SystemExit('ESP application description not found')
+          actual = image[48:80].split(b'\0', 1)[0].decode('ascii')
+          if actual != expected:
+              raise SystemExit(f'Firmware version {actual!r} does not match {expected!r}')
+          print(f'Firmware version: {actual}')
+          PY
+
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
@@ -73,37 +96,45 @@ jobs:
         with:
           fetch-depth: 0
 
-      # 只建 Release（源码 zip + 自动生成的变更说明），按需求不附固件。
-      # 需要 bin 的人去 Actions 下 artifact，或者本地编译。
-      - name: Create GitHub release
+      - name: Download firmware
+        uses: actions/download-artifact@v4
+        with:
+          name: esp32s3-netkeeper-${{ github.sha }}
+          path: firmware
+
+      - name: Publish GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          # 重跑工作流或重新推送已有标签时，保留已有 Release。
+          version=$(tr -d '\r\n' < version)
+          python3 - <<'PY'
+          from pathlib import Path
+          from zipfile import ZIP_DEFLATED, ZipFile
+          base = Path('firmware/build')
+          with ZipFile('esp32s3-netkeeper-firmware.zip', 'w', ZIP_DEFLATED) as archive:
+              for name in ('esp32s3_netkeeper.bin', 'bootloader/bootloader.bin', 'partition_table/partition-table.bin', 'flash_args'):
+                  archive.write(base / name, name)
+          PY
+          cat > release-notes.md <<EOF
+          ## 固件下载
+
+          下载固件压缩包并解压，包含应用固件、bootloader、分区表和 flash_args。
+          固件和源码对应提交 \`${GITHUB_SHA}\`，由 [Actions 构建](${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID})生成。
+
+          > 烧录时 flash-mode 必须用 dio；详情见 README「编译与烧录」。
+
+          更新记录见仓库中的 CHANGELOG.md。
+          EOF
+
           tag_path=$(python3 -c 'import os, urllib.parse; print(urllib.parse.quote(os.environ["GITHUB_REF_NAME"], safe=""))')
           if gh api --include "repos/${GITHUB_REPOSITORY}/releases/tags/${tag_path}" > /tmp/release-response 2> /tmp/release-error; then
-            echo "Release ${GITHUB_REF_NAME} already exists; skipping creation."
-            exit 0
+            gh release edit "$GITHUB_REF_NAME" --title "esp32s3-netkeeper v${version}" --notes-file release-notes.md
+          elif grep -Eq '^HTTP/[0-9.]+ 404([[:space:]]|$)' /tmp/release-response; then
+            gh release create "$GITHUB_REF_NAME" --title "esp32s3-netkeeper v${version}" --notes-file release-notes.md --verify-tag
           elif ! grep -Eq '^HTTP/[0-9.]+ 404([[:space:]]|$)' /tmp/release-response; then
             cat /tmp/release-error >&2
             exit 1
           fi
-
-          printf '%s\n' \
-            '## 关于固件' \
-            '' \
-            '本 Release **不附二进制**。需要 `esp32s3_netkeeper.bin` 的话：' \
-            '' \
-            '- **Actions → build → 最新一次运行 → artifact**（`esp32s3-netkeeper-<sha>`），' \
-            '  里面有 `esp32s3_netkeeper.bin` / `bootloader.bin` / `partition-table.bin` / `flash_args`；' \
-            '- 或者本地 `idf.py build`，见 README「编译与烧录」。' \
-            '' \
-            '> 烧录时 flash-mode 必须用 `dio`：这块板子用 `qio` 烧完 ROM 会在第一段加载后挂死。' \
-            '' \
-            '---' \
-            > /tmp/extra.md
-          gh release create "${GITHUB_REF_NAME}" \
-            --title "esp32s3-netkeeper ${GITHUB_REF_NAME}" \
-            --generate-notes \
-            --notes "$(cat /tmp/extra.md)" \
-            --verify-tag
+          gh release upload "$GITHUB_REF_NAME" --clobber \
+            esp32s3-netkeeper-firmware.zip firmware/build/esp32s3_netkeeper.bin \
+            firmware/build/bootloader/bootloader.bin firmware/build/partition_table/partition-table.bin

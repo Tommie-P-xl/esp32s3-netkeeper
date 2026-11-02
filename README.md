@@ -173,18 +173,18 @@
 | 触发 | 做什么 |
 |---|---|
 | push 到 `main` / PR | 在 `espressif/idf:v6.1` 容器里跑 `idf.py build`，同时打印告警数；产物上传成 Actions artifact（保留 30 天） |
-| 推 `v*` tag | **先编译**（编不过就不发版），成功后用 `gh release create --generate-notes` 建 Release |
+| 推与 `version` 文件一致的 `v*` tag | **先编译**，成功后创建或更新 Release 并上传固件 |
 
 > [!NOTE]
-> Release 里**不挂固件**。要 bin 就从 Actions 里下 artifact（`esp32s3-netkeeper-<sha>`，
-> 含 `esp32s3_netkeeper.bin` / `bootloader.bin` / `partition-table.bin` / `flash_args`），
-> 或者本地 `idf.py build`。
+> Release 中提供固件压缩包和独立的 bin 文件；Actions artifact 也保留构建产物。
 
-发一版只要两步：
+项目版本只在仓库根目录的 `version` 文件中维护；固件版本、发布标签和 Release 标题均从它取得。
+修改该文件并提交后，运行：
 
 ```bash
-git tag -a v1.0.0 -m "v1.0.0: 首个可用版本"
-git push origin v1.0.0     # 推完 Actions 会自动建 Release
+tag="v$(tr -d '\r\n' < version)"
+git tag -a "$tag" -m "$tag"
+git push origin "$tag"     # 推完 Actions 会自动发布 Release
 ```
 
 版本之间改了什么记在 [CHANGELOG.md](CHANGELOG.md) 里（本 README 只讲"现在是怎么做的"，
