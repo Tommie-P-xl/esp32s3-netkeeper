@@ -20,7 +20,7 @@
 
 面向 **SRun Portal**（国内高校最常见的深澜认证系统）。移植到别的 Portal 系统
 （Dr.COM、华为等）需要替换 `main/srun_port.c` 的登录流程，
-细节见[第 15 节](#15-想换成别的-portal-系统drcom--华为--锐捷)。
+细节见[第 14 节](#14-想换成别的-portal-系统drcom--华为--锐捷)。
 
 > [!NOTE]
 > 一块板子 = 一个不用管的网守护。第一次配网在屏幕上点两下，之后断电、换网、掉线都自己恢复；
@@ -54,9 +54,16 @@
   - [11. 电源管理（`power_mgr.c`）](#11-电源管理power_mgrc)
   - [12. 电池状态（`batt_mgr.c` + AXP2101）](#12-电池状态batt_mgrc--axp2101)
   - [13. 构建期配置（`sdkconfig.defaults` 里几个非默认项）](#13-构建期配置sdkconfigdefaults-里几个非默认项)
-  - [14. 踩过的坑（按"症状 → 根因"记）](#14-踩过的坑按症状--根因记)
-  - [15. 想换成别的 Portal 系统（Dr.COM / 华为 / 锐捷）](#15-想换成别的-portal-系统drcom--华为--锐捷)
-- [附录：2026-11 这一轮改了什么](#附录2026-11-这一轮改了什么)
+  - [14. 想换成别的 Portal 系统（Dr.COM / 华为 / 锐捷）](#14-想换成别的-portal-系统drcom--华为--锐捷)
+- [技术路线与关键取舍](#技术路线与关键取舍)
+- [踩坑记录](#踩坑记录)
+  - [显示与 LVGL](#显示与-lvgl)
+  - [触摸与空闲休眠](#触摸与空闲休眠)
+  - [网页与认证](#网页与认证)
+  - [电池与 PMIC](#电池与-pmic)
+  - [构建、烧录与抓图工具](#构建烧录与抓图工具)
+- [更新记录](#更新记录)
+  - [v1.0.0 — 2026-11-02](#v100--2026-11-02)
 - [许可](#许可)
 
 ## 界面预览
@@ -814,22 +821,7 @@ ADC 读数接近 0。比"检测电池 NTC"之类的方案省事，且误判率�
 | `CONFIG_MBEDTLS_MD5_C` / `SHA1_C` | SRun 算法要 MD5 和 SHA1 |
 | `CONFIG_ESP_MAIN_TASK_STACK_SIZE=6144` | `app_main` 里 `db_dump()` 打日志会吃掉不少栈 |
 
-### 14. 踩过的坑（按"症状 → 根因"记）
-
-| 症状 | 根因 | 修法 |
-|---|---|---|
-| 画面冻住、点屏没反应，但 HTTP 正常、`uptime` 在涨 | `bsp_display_lock()` 返回值语义反了（`ESP_OK==0` 转 bool 成 false），临界区被跳过、锁泄漏 | 一律用 `ui_lock()`（`== ESP_OK` 判定） |
-| 网页一直「读取中」 | `httpd_resp_send_chunk` 少发结束块 | 末尾补 `send_chunk(req, NULL, 0)` |
-| 汉字变方框 | 混排行用了 `lv_font_montserrat_14`，它没有 `·` 和汉字 | 混排一律 `ui_font_18`，并用 `font_coverage.py` 校验 |
-| 中文大面积缺失（网/认/证/检/测） | LVGL 自带 CJK 字体是日文子集 | 自己按源码用字生成子集字体 |
-| 「添加账号」按钮点了没反应 | `build_add_screen()` 定义了但从没调用，`s_scr_add` 恒为 NULL | 改成懒建：NULL 时先建再进屏 |
-| 输密码页进不去 | 同上（`s_scr_pass` 也是 NULL） | 同上 |
-| 烧完就挂，串口只有 `ets_loader.c` | 用了 qio 烧录，ROM 按 QIO 启动后挂死 | `flash.ps1` 里写死 `--flash-mode dio` |
-| 熄屏后点击无反应 | INT 脉冲在 10 ms 轮询里被漏掉 / 当时还在 dump 显存 | 轮询 + 状态机双重判定，调试开关用完必须关 |
-| 界面文字被键盘压住 | 键盘固定占底部 250 px | 输入控件与按钮排在 y<230 |
-| 标题太长压住时钟 | 把动态 SSID 拼进标题 | 标题固定文案 + SSID 单独一行 + 省略号 |
-
-### 15. 想换成别的 Portal 系统（Dr.COM / 华为 / 锐捷）
+### 14. 想换成别的 Portal 系统（Dr.COM / 华为 / 锐捷）
 
 改动被刻意收在一个文件里：
 
@@ -842,37 +834,105 @@ ADC 读数接近 0。比"检测电池 NTC"之类的方案省事，且误判率�
 `net_guard.c`、`db.c`、`web.c`、UI 全部与协议无关，一行都不用动——它们只关心
 "`probe` 说要不要认证、`login` 说成没成功"。
 
-## 附录：2026-11 这一轮改了什么
+---
 
-按"加功能 → 撞坑 → 定性 → 修"的顺序记一遍。每条都附上现场证据，方便以后遇到类似现象时对号入座。
+## 技术路线与关键取舍
 
-### 新增的能力
+一句话概括路线：**协议层尽量窄（只做 SRun 一家做透），其余部分尽量笨（能查表就不搞模型，
+能手算就不上库）**。每个决策后面都写清备选方案为什么被否——这才是"路线"而不是"实现细节"。
 
-| 能力 | 落点 | 说明 |
+| 决策 | 选了什么 | 为什么，以及否掉了什么 |
 |---|---|---|
-| 电池电量 + 续航估计 | `batt_mgr.c` | 读 AXP2101（I2C 0x34）的 VBAT 与充放电状态位；没有电流 ADC，续航按功耗模型估 |
-| 充电状态三档 | `ui.c` + `batt_mgr.c` | `充电中` / `已充满` / `已接电源`，不再只看"USB 在位" |
-| 烧录后自动复位 | `flash.ps1` | 写入用 `no-reset`，成功后单独发一次 `watchdog-reset`，避免烧完停在下载模式 |
-| 抓图不再阻塞界面 | `ui.c` | 快照留在 LVGL 线程（几十毫秒），hex 发送交给独立 `fbdump` 任务 |
-| 空闲诊断开关 | `APP_IDLE_DEBUG` | 打开后每 2 秒打一行 `idle / int_low / press / screen`，定位"不熄屏"这类问题全靠它 |
+| 认证协议 | 只实现 SRun，字段级对齐登录页 JS | 换学校的成本压在 `srun_port.c` + `srun_crypto.c` 两个文件里；不做"通用 Portal 框架"，那种抽象在没有第二个真实样本前一定是错的 |
+| 网络判定 | `generate_204` 探测 + 302 抓 `ac_id` | 不解析登录页 HTML（学校一改版就崩）；不写死 Portal 域名（NAT 后面取到的 `client_ip` 更可靠） |
+| 认证成功判定 | 登录返回 ok **后**再探一次外网 | 只信 Portal 的返回值会踩"返回成功但没放行"（限速、欠费、设备数超限），多一次 GET 换来状态可信 |
+| UI 线程模型 | LVGL 单任务 + 一把递归锁 | 不用"每屏一个任务"：LVGL 不是线程安全的，多任务只会把竞态藏得更深；也不用全局无锁，跨任务的写最终会打架 |
+| 配置存储 | NVS + SD 双写，SD 优先 | 只存 NVS 的话，改配置必须重烧；只用 SD 的话，没插卡就不能用。双写 + 人可读 INI 让"读卡器改完插回来重启"成为一条正式路径 |
+| 电量计算 | AXP2101 电压查表 + 充电补偿 | AXP2101 有 E-Gauge（`0xA4`），但没做电池标定时读数不可信，所以**不采信**它，用确定性更强的电压曲线 |
+| 续航估计 | 按工作状态取电流的功耗模型 | AXP2101 **没有电流 ADC**，库仑计也不存在；与其编一个"精确"数字，不如明确写成"约 XhYYm"并把三个电流常量暴露在 `app_config.h` 里 |
+| 中文字体 | 从系统黑体按源码用字生成子集（约 730 KB） | LVGL 自带 CJK 字体是偏日文的子集，缺「网/认/证/检/测」；全量 CJK 十几 MB 不适合 8 MB app 分区。生成物入库，保证 clone 后不装 Node 也能编 |
+| 配置页 | `index.html` 编译期嵌进固件 | 不需要文件系统、不怕 SD 卡坏；代价是改页面必须重编，对这个规模可以接受 |
+| 抓图 | 串口 dump 显存 + 电脑端还原 PNG | 板上没有截图能力，也没有可写的大容量存储；dump 走独立任务（见踩坑），抓图时界面照常动 |
+| 烧录参数 | 写死 `--flash-mode dio` | 这块板 `qio` 会在第一段加载后挂死，属于硬件/ROM 层面的坑，不给"可配置"留口子 |
+| CI | 固定 `espressif/idf:v6.1` 容器 | 不用 `latest`：IDF 大版本之间 Kconfig 会变，`sdkconfig.defaults` 一旦对不上就是一堆莫名报错 |
 
-### 踩的坑
+明确**没做**的三件事，以及原因：
+
+- **不做 OTA**：设备装在宿舍墙上，一次烧录长期使用；OTA 要配套分区切换、回滚、签名，收益不抵复杂度。
+- **不做多协议适配层**：见上表第一行，没有第二个真实样本就不抽象。
+- **不做手机 App**：局域网网页 + 屏幕已经覆盖全部操作，多一个 App 就多一套发布与兼容负担。
+
+---
+
+## 踩坑记录
+
+按子系统分组。每条都是「症状 → 根因 → 修法」，修法后面标了对应章节，方便回看实现。
+
+### 显示与 LVGL
 
 | 症状 | 根因 | 修法 |
 |---|---|---|
-| 插着充电器时屏幕不熄，或熄灭后立刻又亮 | 老代码拿触摸 **INT 电平**当"有活动"。CST9217 会把 INT 拉住直到报告被读走，这个状态一旦卡住（充电噪声、熄屏后没人读），空闲计时被每 10 ms 刷新一次 | 唤醒只认 **高→低边沿**（且熄灭 >300 ms）；活动必须 **INT 低 + `lv_indev_get_state()==PRESSED`**。详见[第 11 节](#11-电源管理power_mgrc) |
-| 抓图那几分钟里时钟、倒计时全冻住，熄屏也推迟 | 整屏 hex 直接在 `lv_timer` 回调里写串口，一屏 90 秒，LVGL 任务被占死 | 快照与发送拆成两个任务；抓图期间界面照常动 |
-| 抓图过程中板子突然重启，整个序列报废 | `assert failed: spi_device_release_bus`——快照触发离屏渲染，与面板在途的 QSPI 刷新撞车 | 快照前 `lv_refr_now(NULL)` + 30 ms，把在途刷新收干净 |
-| GitHub 上看到的截图一直是旧的 | 图生成到了项目根 `docs/images/`，而 README 引用 `portal_guard/docs/images/`，`git add` 静默跳过 | 固定用 `_mk_shots.py` 只往仓库目录写；提交后 `curl 远端 \| md5sum` 与本地逐张比对 |
-| 截图下半截全黑 | 串口无流控，某一行少了 32 个像素；PNG 每行必须定长，短行让解码器错位 | 短行补黑并打印 `padded N short row(s)`（丢的总在行尾，那块本来就是背景） |
-| 主页首图是 `LINKING / 未联网 / 运行时长 00:02` | 抓图定时器设在开机 3 秒 | 延后到 30 秒，等连网 + SNTP 校时完成 |
-| 电池 98% 已停充，界面却写"充电中" | 只判断"USB 在位"，没看 AXP2101 的充电状态位（0 待机 / 1 充电 / 3 充满） | 按状态位分三档，见上表 |
-| 烧完屏幕全黑、串口一个字都没有 | EN 没接 USB 的 RTS，`--after hard-reset` 是空操作，芯片停在 ROM 下载模式 | `flash.ps1` 追加 `watchdog-reset`；仍不行就长按 PWR |
-| 编译时一堆 `lv_obj_remove_flag is deprecated` | LVGL 9.6 把 flag API 换成了"一个 flag 一个 setter" | `ui_common.h` 用 `LV_VERSION_CHECK` 包一层 `ui_obj_*`，新旧版本都不告警 |
+| 画面冻住、点屏没反应，但 HTTP 正常、`uptime` 在涨 | `bsp_display_lock()` 把 `esp_err_t` 直接转 `bool`，而 `ESP_OK==0`——拿到锁反而判成失败，临界区被跳过、锁泄漏 | 全项目只用 `ui_lock()`（`== ESP_OK` 判定），禁用 BSP 那个函数的返回值。[§10](#10-ui一条线程一把锁一套排版规则uic--ui_commonc--ui_setupc) |
+| 汉字变方框（tofu） | 混排行用了 `lv_font_montserrat_14`，它既没有 `·` 也没有汉字 | 混排一律 `ui_font_18`，并用 `font_coverage.py` 校验覆盖率。[§10](#10-ui一条线程一把锁一套排版规则uic--ui_commonc--ui_setupc) |
+| 「网 / 认 / 证 / 检 / 测」大面积缺字 | LVGL 自带 `SOURCE_HAN_SANS_SC_16_CJK` 其实是偏日文的子集 | 按源码用字生成子集字体（`collect_symbols.py` → `node gen.js`）。[§10](#10-ui一条线程一把锁一套排版规则uic--ui_commonc--ui_setupc) |
+| 输入框和按钮被键盘挡住、点了没反应 | 键盘固定占底部 250 px（顶边 y=230），按钮排在 y=218 | 带键盘的页面，控件一律排在 `y < 230`。[§10](#10-ui一条线程一把锁一套排版规则uic--ui_commonc--ui_setupc) |
+| 标题太长压到时钟和返回键 | 把动态 SSID 拼进了标题行 | 标题只放固定文案，动态内容另起一行 + `LV_LABEL_LONG_DOT`。[§10](#10-ui一条线程一把锁一套排版规则uic--ui_commonc--ui_setupc) |
+| 编译时一堆 `lv_obj_remove_flag is deprecated` | LVGL 9.6 把 flag API 换成"一个 flag 一个 setter" | `ui_common.h` 用 `LV_VERSION_CHECK` 包一层 `ui_obj_scrollable/clickable/hidden`，新旧版本都不告警。[§10](#10-ui一条线程一把锁一套排版规则uic--ui_commonc--ui_setupc) |
 
-### 这一轮的验证证据
+### 触摸与空闲休眠
 
-插着 USB 充电的串口实测（240 秒窗口，无重启）：
+| 症状 | 根因 | 修法 |
+|---|---|---|
+| 插着充电器时屏幕不熄，或熄灭后立刻又亮 | 拿触摸 **INT 电平**当"有活动"。CST9217 会把 INT 拉住直到报告被读走，一旦卡住（充电噪声、熄屏后没人读），空闲计时被每 10 ms 刷新 | 唤醒只认 **高→低边沿**（且熄灭 >300 ms）；活动必须 **INT 低 + `lv_indev_get_state()==PRESSED`**。[§11](#11-电源管理power_mgrc) |
+| 熄屏后点击没反应 | 同上：INT 脉冲被漏采 / 当时还在 dump 显存；旧代码没有"边沿 + 死区"的概念 | 边沿唤醒 + 300 ms 死区；抓图改成独立任务，不再占住 LVGL。[§11](#11-电源管理power_mgrc) |
+| 「添加账号」「输密码」页进不去 | `build_add_screen()` 定义了却从没被调用，`s_scr_add` / `s_scr_pass` 恒为 NULL | 改成懒建：进屏时若为 NULL 先建再进。[§10](#10-ui一条线程一把锁一套排版规则uic--ui_commonc--ui_setupc) |
+
+### 网页与认证
+
+| 症状 | 根因 | 修法 |
+|---|---|---|
+| 浏览器一直「读取中」，`curl` 却正常 | `httpd_resp_send_chunk()` 分块发完没发结束块；`curl` 容忍"连接关闭即结束"，`fetch()` 会一直等 | 末尾补 `httpd_resp_send_chunk(req, NULL, 0)`。[§9](#9-局域网配置面板webc--indexhtml) |
+
+### 电池与 PMIC
+
+| 症状 | 根因 | 修法 |
+|---|---|---|
+| 98% 已停充，界面却写「充电中」 | 只看"USB 在位"，没看 AXP2101 的充电状态位（0 待机 / 1 充电 / 3 充满） | 分三档：充电中 / 已充满 / 已接电源。[§12](#12-电池状态batt_mgrc--axp2101) |
+| 电量显示虚高，一拔线就掉一截 | 充电时 VBAT 被线损和极化抬高 | 查表前减 `APP_BAT_CHG_OFFSET_MV`（40 mV），且只在实际充电时减。[§12](#12-电池状态batt_mgrc--axp2101) |
+
+### 构建、烧录与抓图工具
+
+| 症状 | 根因 | 修法 |
+|---|---|---|
+| 烧完就挂，串口只有 `ets_loader.c 78` 然后反复复位 | 用了 `qio` 烧录，ROM 按 QIO 启动后在第一段加载后挂死 | `flash.ps1` 写死 `--flash-mode dio`。 |
+| 烧完屏幕全黑、串口一个字都没有、网页也打不开 | 这块板 **EN 没接 USB 的 RTS**，`--after hard-reset` 是空操作，芯片停在 ROM 下载模式 | 写入用 `no-reset`，成功后再单独发 `watchdog-reset`；仍不行长按 PWR 冷启动。 |
+| 抓图那几分钟时钟、倒计时全冻住，熄屏也推迟 | 整屏 hex 直接在 `lv_timer` 回调里写串口，一屏 90 秒，LVGL 任务被占死 | 快照留在 LVGL 线程（几十毫秒），hex 发送交给独立 `fbdump` 任务。 |
+| 抓图过程中板子突然重启，整个序列报废 | `assert failed: spi_device_release_bus`——快照触发离屏渲染，与面板在途的 QSPI 刷新撞车 | 快照前 `lv_refr_now(NULL)` + 30 ms。 |
+| 截图下半截全黑 | 串口无流控，某一行少了 32 个像素；PNG 每行必须定长，短行让解码器从该行起错位 | 短行补黑并打印 `padded N short row(s)`。 |
+| GitHub 上的截图一直是旧的 | 图生成到了项目根 `docs/images/`，README 引用的是 `portal_guard/docs/images/`，`git add` 静默跳过 | 固定用 `_mk_shots.py` 只往仓库目录写；提交后 `curl 远端 \| md5sum` 逐张比对。 |
+| 主页首图是 `LINKING / 未联网 / 运行时长 00:02` | 抓图定时器设在开机 3 秒 | 延后到 30 秒，等联网 + SNTP 校时完成。 |
+| 界面文字全是方块，但字体文件明明有中文 | `sdkconfig` 里 `CONFIG_LV_FONT_*` 没开，或生成字体的 `--bpp` 与 `LV_USE_FONT_COMPRESSED` 不匹配 | 对齐 `sdkconfig.defaults`；改字体参数后必须整机重编。 |
+
+---
+
+## 更新记录
+
+### v1.0.0 — 2026-11-02
+
+首个可用版本。功能面：SRun 自动认证、掉线自愈、5 分钟轮询、局域网配置面板、
+480×480 触摸屏、电池电量与续航估计、SD/NVS 双份配置。
+
+这一版相对最早的 bring-up，主要变化：
+
+| 变化 | 落点 |
+|---|---|
+| 电池电量 + 续航估计 + 充电三档显示 | `batt_mgr.c`、`ui.c` |
+| 空闲休眠改用「边沿唤醒 + 真实按下」，修掉充电时不熄屏 | `power_mgr.c` |
+| 抓图异步化，不再冻住界面；修掉偶发的 QSPI 断言 | `ui.c` |
+| 烧录后自动 `watchdog-reset`，不再烧完黑屏 | `flash.ps1` |
+| CI：push/PR 自动编译，`v*` tag 自动发 Release（不附固件） | `.github/workflows/ci.yml` |
+
+插着 USB 充电时的空闲时序实测（240 秒窗口，无重启）：
 
 ```
 I (124381) power_mgr: cpu clock -> 240 MHz          ← 触摸唤醒生效
@@ -881,12 +941,12 @@ I (194424) power_mgr: no touch for 70 s, idle: cpu 80 MHz, panel off
 I (194428) power_mgr: cpu clock -> 80 MHz           ← 休眠
 ```
 
-`/api/state` 同步暴露了电池状态，可以直接用 curl 核对界面显示：
+`/api/state` 可直接核对界面显示：
 
 ```bash
 curl -s http://<板子IP>/api/state | python -m json.tool
 # bat_present / bat_pct / bat_mv / bat_usb / bat_charging / bat_min
-# 98% 停充时：bat_usb=true, bat_charging=false → 界面显示「已接电源」
+# 例：98% 停充 → bat_usb=true, bat_charging=false → 界面显示「已接电源」
 ```
 
 ## 许可
