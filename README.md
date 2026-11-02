@@ -13,6 +13,9 @@
 [![Board](https://img.shields.io/badge/Board-AMOLED%202.16-E67E22.svg?style=flat-square)](https://www.waveshare.com/)
 [![Protocol](https://img.shields.io/badge/Portal-SRun%20%2F%20%E6%B7%B1%E6%BE%9C-1ABC9C.svg?style=flat-square)](#实现细节教学向)
 
+[![build](https://github.com/Tommie-P-xl/esp32s3-netkeeper/actions/workflows/ci.yml/badge.svg)](https://github.com/Tommie-P-xl/esp32s3-netkeeper/actions/workflows/ci.yml)
+[![release](https://img.shields.io/github/v/release/Tommie-P-xl/esp32s3-netkeeper?style=flat-square&label=release)](https://github.com/Tommie-P-xl/esp32s3-netkeeper/releases)
+
 </div>
 
 面向 **SRun Portal**（国内高校最常见的深澜认证系统）。移植到别的 Portal 系统
@@ -29,6 +32,7 @@
 - [支持硬件](#支持硬件)
 - [功能](#功能)
 - [编译与烧录](#编译与烧录)
+- [自动化构建与发布](#自动化构建与发布)
 - [配置存在哪、谁优先](#配置存在哪谁优先)
 - [屏幕操作](#屏幕操作)
 - [网页配置](#网页配置)
@@ -153,6 +157,29 @@
 
 首次开机若两块存储都为空，会用 `main/app_config.h` 里的默认值播种一份配置，
 所以"改完宏定义烧一次"就能直接用。
+
+---
+
+## 自动化构建与发布
+
+`.github/workflows/ci.yml` 两件事：
+
+| 触发 | 做什么 |
+|---|---|
+| push 到 `main` / PR | 在 `espressif/idf:v6.1` 容器里跑 `idf.py build`，同时打印告警数；产物上传成 Actions artifact（保留 30 天） |
+| 推 `v*` tag | **先编译**（编不过就不发版），成功后用 `gh release create --generate-notes` 建 Release |
+
+> [!NOTE]
+> Release 里**不挂固件**。要 bin 就从 Actions 里下 artifact（`esp32s3-netkeeper-<sha>`，
+> 含 `esp32s3_netkeeper.bin` / `bootloader.bin` / `partition-table.bin` / `flash_args`），
+> 或者本地 `idf.py build`。
+
+发一版只要两步：
+
+```bash
+git tag -a v1.0.0 -m "v1.0.0: 首个可用版本"
+git push origin v1.0.0     # 推完 Actions 会自动建 Release
+```
 
 ---
 

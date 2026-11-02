@@ -1,0 +1,99 @@
+name: build
+
+# 每次 push 到 main / PR 都编译一遍（防止"本地能过、别人拉下来编不过"）；
+# 打 v* tag 时额外建一个 Release（只发源码和自动生成的说明，不挂二进制）。
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: build (esp-idf v6.1)
+    runs-on: ubuntu-latest
+    container:
+      image: espressif/idf:v6.1
+      # 容器里默认是 root，显式声明免得 mount 出来的工作区没有写权限
+      options: --user root
+    steps:
+      - uses: actions/checkout@v4
+
+      # 组件管理器要拉 LVGL 和 Waveshare 的 BSP，缓存能省下几分钟
+      - name: Cache component manager
+        uses: actions/cache@v4
+        with:
+          path: ~/.espressif
+          key: idf-${{ hashFiles('main/idf_component.yml', 'components/*/idf_component.yml', 'dependencies.lock') }}
+          restore-keys: idf-
+
+      - name: Build
+        shell: bash
+        run: |
+          . $IDF_PATH/export.sh >/dev/null
+          echo "IDF: $(idf.py --version)"
+          idf.py set-target esp32s3
+          idf.py build 2>&1 | tee build.log
+          echo "--- 告警统计 ---"
+          grep -c "warning:" build.log || echo "0 warning"
+
+      - name: Firmware size
+        run: |
+          ls -l build/esp32s3_netkeeper.bin
+          python3 -c "import os;print('app: %.2f MB' % (os.path.getsize('build/esp32s3_netkeeper.bin')/1048576))"
+
+      # 产物留在 Actions artifacts 里（按需求不挂到 Release 上）
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: esp32s3-netkeeper-${{ github.sha }}
+          path: |
+            build/esp32s3_netkeeper.bin
+            build/bootloader/bootloader.bin
+            build/partition_table/partition-table.bin
+            build/flash_args
+            build.log
+          retention-days: 30
+          if-no-files-found: error
+
+  release:
+    name: release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # 只建 Release（源码 zip + 自动生成的变更说明），按需求不附固件。
+      # 需要 bin 的人去 Actions 下 artifact，或者本地编译。
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          printf '%s\n' \
+            '## 关于固件' \
+            '' \
+            '本 Release **不附二进制**。需要 `esp32s3_netkeeper.bin` 的话：' \
+            '' \
+            '- **Actions → build → 最新一次运行 → artifact**（`esp32s3-netkeeper-<sha>`），' \
+            '  里面有 `esp32s3_netkeeper.bin` / `bootloader.bin` / `partition-table.bin` / `flash_args`；' \
+            '- 或者本地 `idf.py build`，见 README「编译与烧录」。' \
+            '' \
+            '> 烧录时 flash-mode 必须用 `dio`：这块板子用 `qio` 烧完 ROM 会在第一段加载后挂死。' \
+            '' \
+            '---' \
+            > /tmp/extra.md
+          gh release create "${GITHUB_REF_NAME}" \
+            --title "esp32s3-netkeeper ${GITHUB_REF_NAME}" \
+            --generate-notes \
+            --notes "$(cat /tmp/extra.md)" \
+            --verify-tag
