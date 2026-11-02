@@ -15,6 +15,7 @@
 
 [![build](https://github.com/Tommie-P-xl/esp32s3-netkeeper/actions/workflows/ci.yml/badge.svg)](https://github.com/Tommie-P-xl/esp32s3-netkeeper/actions/workflows/ci.yml)
 [![release](https://img.shields.io/github/v/release/Tommie-P-xl/esp32s3-netkeeper?style=flat-square&label=release)](https://github.com/Tommie-P-xl/esp32s3-netkeeper/releases)
+[![changelog](https://img.shields.io/badge/changelog-CHANGELOG.md-6C7A89.svg?style=flat-square)](CHANGELOG.md)
 
 </div>
 
@@ -62,8 +63,6 @@
   - [网页与认证](#网页与认证)
   - [电池与 PMIC](#电池与-pmic)
   - [构建、烧录与抓图工具](#构建烧录与抓图工具)
-- [更新记录](#更新记录)
-  - [v1.0.0 — 2026-11-02](#v100--2026-11-02)
 - [许可](#许可)
 
 ## 界面预览
@@ -188,24 +187,33 @@ git tag -a v1.0.0 -m "v1.0.0: 首个可用版本"
 git push origin v1.0.0     # 推完 Actions 会自动建 Release
 ```
 
+版本之间改了什么记在 [CHANGELOG.md](CHANGELOG.md) 里（本 README 只讲"现在是怎么做的"，
+不堆历史）；发版时同步在那边加一节。
+
 ---
 
 ## 配置存在哪、谁优先
 
-```
-            ┌──────────────────────────┐
-   修改 ───► │ 片上 NVS (namespace=portal) │  ◄── 始终写
-            └──────────────────────────┘
-                        │ 同时
-                        ▼
-            ┌──────────────────────────┐
-            │ /sdcard/portal/net.cfg    │  ◄── 有卡才写
-            └──────────────────────────┘
+**写入路径：一次改动，两处落地**
 
-开机加载顺序：
-  SD 有文件且能解析  ──► 用 SD，覆盖 NVS        （SD 优先）
-  SD 没有/解析为空   ──► 用 NVS，顺手补写一份到 SD
-  两边都空           ──► 用编译期默认值播种
+```mermaid
+flowchart LR
+    M["改配置<br/>（屏幕 / 网页 / 读卡器）"] --> NVS[("片上 NVS<br/>namespace = portal")]
+    M --> SD[("SD 卡<br/>/portal/net.cfg")]
+    NVS -.->|"内容始终一致"| SD
+```
+
+**开机加载顺序**
+
+```mermaid
+flowchart TD
+    B([开机]) --> Q1{"SD 卡挂载成功？"}
+    Q1 -- 否 --> N1["只读 NVS"]
+    Q1 -- 是 --> Q2{"卡上有 net.cfg 且能解析？"}
+    Q2 -- 是 --> S1["以 SD 为准，覆盖 NVS"]
+    Q2 -- 否 --> Q3{"NVS 里有配置？"}
+    Q3 -- 是 --> N2["用 NVS，顺手补写一份到 SD"]
+    Q3 -- 否 --> D1["用编译期默认值播种（NVS + SD 都写）"]
 ```
 
 - 没插卡：完全正常，配置只在片上 Flash。
@@ -489,29 +497,50 @@ WiFi 关联可能要几秒，不能让用户白等一块黑屏。
 
 `net_task` 是一个"永远不退出"的循环，每一轮做六件事：
 
-```
-┌─ ① 有没有人要求试连新网络？（网页"添加 WiFi"、屏幕选网）
-│     有 → 连它；连上才把 active 切过去，连不上保持原网络
-├─ ② 读 active SSID，空 → 状态 NEED_SETUP，等 2 s 重来
-├─ ③ 从库里取这个 SSID 的 WiFi 密码
-├─ ④ 确保已连接（当前连的不是它才重连），等 IP，最多 20 s
-│     失败计数 +1；连续 2 次失败 → 回退 last_ok 或库里任意另一个网络
-├─ ⑤ 取该网络当前选中的认证账号，没有 → NO_ACCOUNT，等 3 s
-└─ ⑥ run_cycle()：探测 → 必要时认证 → 再探测确认
-      成功 → 睡 APP_POLL_INTERVAL_MS（5 分钟）
-      失败 → 按 30 s / 60 s / 120 s 退避，之后回到 5 分钟
+```mermaid
+flowchart TD
+    S([循环开始]) --> A{"① 有人要求试连新网络？"}
+    A -- 有 --> A1["连它"]
+    A1 --> A2{"拿到 IP？"}
+    A2 -- 是 --> A3["把 active / last_ok 切过去"]
+    A3 --> B
+    A2 -- 否 --> A4["保持原网络，等 2 s"] --> S
+    A -- 无 --> B["② 读 active SSID"]
+    B --> B1{"为空？"}
+    B1 -- 是 --> B2["状态 NEED_SETUP，等 2 s"] --> S
+    B1 -- 否 --> C["③ 从库里取该 SSID 的 WiFi 密码"]
+    C --> D["④ 确保已连接并等 IP（最多 20 s）"]
+    D --> D1{"成功？"}
+    D1 -- 否 --> D2["失败计数 +1；连续 2 次 → 回退 last_ok 或库里其他网络"] --> D3["等 5 s"] --> S
+    D1 -- 是 --> E["⑤ 取该网络当前认证账号"]
+    E --> E1{"有账号？"}
+    E1 -- 否 --> E2["状态 NO_ACCOUNT，等 3 s"] --> S
+    E1 -- 是 --> F["⑥ run_cycle：探测 → 必要时认证 → 再探测确认"]
+    F --> F1{"外网通？"}
+    F1 -- 是 --> F2["睡 5 分钟（APP_POLL_INTERVAL_MS）"] --> S
+    F1 -- 否 --> F3["按 30 s / 60 s / 120 s 退避，之后回到 5 分钟"] --> S
 ```
 
 状态机就是 `net_status_t.state`，共 11 个值（`net_guard.h`）：
 
-```
-BOOT → WIFI_CONNECTING → CHECKING → ONLINE
-                    │         ├→ NEED_AUTH → AUTHING → ONLINE
-                    │         │                    └→ AUTH_FAILED
-                    │         └→ ERROR（探不到 Portal / 无链路）
-                    ├→ WIFI_DOWN（连不上，20 s 超时）
-                    └→ NO_ACCOUNT（没填校园网账号）
-NEED_SETUP（还没选网）  ← 从任意状态都可能回到这里（网络全挂时）
+```mermaid
+stateDiagram-v2
+    [*] --> BOOT
+    BOOT --> WIFI_CONNECTING : 守护任务启动
+    WIFI_CONNECTING --> CHECKING : 拿到 IP
+    WIFI_CONNECTING --> WIFI_DOWN : 20 s 超时
+    CHECKING --> ONLINE : 探测到 204
+    CHECKING --> NEED_AUTH : 被 302 劫持
+    CHECKING --> ERROR : 探不到 Portal / 无链路
+    CHECKING --> NO_ACCOUNT : 该网络没有认证账号
+    NEED_AUTH --> AUTHING : 组装 hmd5 / info / chksum
+    AUTHING --> ONLINE : 认证后再探一次通了
+    AUTHING --> AUTH_FAILED : Portal 返回失败
+    ONLINE --> CHECKING : 下次轮询 / 掉线
+    AUTH_FAILED --> CHECKING : 退避后重试
+    NO_ACCOUNT --> CHECKING : 补了账号
+    WIFI_DOWN --> NEED_SETUP : 库里没有可回退的网络
+    NEED_SETUP --> WIFI_CONNECTING : 用户选好网络
 ```
 
 三个"防呆"设计，都是为了不把板子搞成砖：
@@ -662,12 +691,21 @@ rename 在同一文件系统内是原子的，最坏情况是"新文件没生成
 
 **验证码 + token 的模型**（防的是"同一局域网的人误改"，不是防专业攻击者）：
 
-```
-屏幕显示 6 位码（esp_random），TTL 5 min，屏幕上带倒计时
-  └─ 网页输入 → POST /api/auth → 校验 → 发 16 字符 token（8 个槽位，LRU 淘汰）
-       └─ token 存在浏览器 localStorage，之后每个写请求都带上
-            └─ token 生命周期 7 天，与验证码完全独立 → 换码不影响已登录的页面
-连错 5 次 → 锁 60 s（避免 6 位数被穷举）
+```mermaid
+sequenceDiagram
+    participant S as 屏幕
+    participant B as 板子（web.c）
+    participant W as 浏览器
+
+    S->>B: 显示 6 位码（esp_random，TTL 5 min，带倒计时）
+    W->>B: POST /api/auth  { code }
+    alt 验证码正确
+        B-->>W: 16 字符 token（8 个槽位，LRU 淘汰）
+        Note over W: 存 localStorage<br/>之后每个写请求都带上
+        Note over B: token 有效期 7 天<br/>与验证码完全独立 → 换码不影响已登录页面
+    else 连错 5 次
+        B-->>W: 锁 60 s（避免 6 位数被穷举）
+    end
 ```
 
 **这里有一个必须记住的 HTTP 细节**：`/api/state` 用 `httpd_resp_send_chunk()`
@@ -733,10 +771,13 @@ bool ui_lock(int timeout_ms) {
 
 三级策略，都靠"最后一次触摸时间"驱动：
 
-```
-10 s 没触摸  → 背光 0（熄屏），LVGL 继续跑，net_guard 照常轮询
-再 60 s      → 把 CPU 上限/下限都设成 80 MHz（esp_pm_configure）
-触摸 INT     → 立刻回 240 MHz + 背光恢复
+```mermaid
+stateDiagram-v2
+    [*] --> ACTIVE
+    ACTIVE --> BLANK : 10 s 无触摸（背光 0，LVGL 照常跑）
+    BLANK --> IDLE : 再 60 s（CPU 降到 80 MHz）
+    BLANK --> ACTIVE : 触摸（INT 高→低边沿）
+    IDLE --> ACTIVE : 触摸（回 240 MHz + 背光）
 ```
 
 `POWER_MGR_LIGHT_SLEEP` 默认 **0**（不真睡）。改成 1 会 `esp_light_sleep_start()`
@@ -914,40 +955,6 @@ ADC 读数接近 0。比"检测电池 NTC"之类的方案省事，且误判率�
 | 界面文字全是方块，但字体文件明明有中文 | `sdkconfig` 里 `CONFIG_LV_FONT_*` 没开，或生成字体的 `--bpp` 与 `LV_USE_FONT_COMPRESSED` 不匹配 | 对齐 `sdkconfig.defaults`；改字体参数后必须整机重编。 |
 
 ---
-
-## 更新记录
-
-### v1.0.0 — 2026-11-02
-
-首个可用版本。功能面：SRun 自动认证、掉线自愈、5 分钟轮询、局域网配置面板、
-480×480 触摸屏、电池电量与续航估计、SD/NVS 双份配置。
-
-这一版相对最早的 bring-up，主要变化：
-
-| 变化 | 落点 |
-|---|---|
-| 电池电量 + 续航估计 + 充电三档显示 | `batt_mgr.c`、`ui.c` |
-| 空闲休眠改用「边沿唤醒 + 真实按下」，修掉充电时不熄屏 | `power_mgr.c` |
-| 抓图异步化，不再冻住界面；修掉偶发的 QSPI 断言 | `ui.c` |
-| 烧录后自动 `watchdog-reset`，不再烧完黑屏 | `flash.ps1` |
-| CI：push/PR 自动编译，`v*` tag 自动发 Release（不附固件） | `.github/workflows/ci.yml` |
-
-插着 USB 充电时的空闲时序实测（240 秒窗口，无重启）：
-
-```
-I (124381) power_mgr: cpu clock -> 240 MHz          ← 触摸唤醒生效
-I (134424) power_mgr: no touch for 10 s, panel off  ← 熄屏
-I (194424) power_mgr: no touch for 70 s, idle: cpu 80 MHz, panel off
-I (194428) power_mgr: cpu clock -> 80 MHz           ← 休眠
-```
-
-`/api/state` 可直接核对界面显示：
-
-```bash
-curl -s http://<板子IP>/api/state | python -m json.tool
-# bat_present / bat_pct / bat_mv / bat_usb / bat_charging / bat_min
-# 例：98% 停充 → bat_usb=true, bat_charging=false → 界面显示「已接电源」
-```
 
 ## 许可
 
