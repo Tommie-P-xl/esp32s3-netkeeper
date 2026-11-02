@@ -144,7 +144,10 @@ static void batt_poll(void)
     memset(&info, 0, sizeof(info));
     info.present = (mv >= PRESENT_MV);
     info.usb = usb;
-    info.charging = info.present && usb && (chg_state == 1 || chg_state == 3);
+    /* status2[7:5]: 0 待机 / 1 充电中 / 2 放电 / 3 充电完成
+     * 注意 standby(0) 和 done(3) 都不是"正在充"：满电后 AXP2101 会停充进待机，
+     * 这时 USB 还在，但电流已经是零了。分开表示，界面才不会把"停充"说成"充电中"。 */
+    info.charging = info.present && usb && (chg_state == 1);
     info.full = info.present && usb && (chg_state == 3);
     info.mv = mv;
     info.pct = info.present ? pct_from_mv(mv - (info.charging ? APP_BAT_CHG_OFFSET_MV : 0)) : 0;

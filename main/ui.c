@@ -199,9 +199,14 @@ static void ui_timer_cb(lv_timer_t *t)
         } else {
             char buf[40];
             if (bat.usb) {
-                snprintf(buf, sizeof(buf), "电池 %d%% · %s", bat.pct,
-                         bat.full ? "已充满" : "充电中");
-                lv_obj_set_style_text_color(s_ui.v_bat, UI_COL_GREEN, 0);
+                /* 三档：真在充 / 充满停充 / 接了电源但没在充（满电待机、充电被限流等）。
+                 * 只看"USB 在位"会把停充说成"充电中"，实测 98% 停充时就是这样。 */
+                const char *st = bat.full ? "已充满"
+                                          : (bat.charging ? "充电中" : "已接电源");
+                snprintf(buf, sizeof(buf), "电池 %d%% · %s", bat.pct, st);
+                lv_obj_set_style_text_color(
+                    s_ui.v_bat,
+                    (bat.full || bat.charging) ? UI_COL_GREEN : UI_COL_MUTED, 0);
             } else {
                 const lv_color_t col = (bat.pct <= 15) ? UI_COL_RED : UI_COL_SKY;
                 if (bat.minutes_left < 0) {

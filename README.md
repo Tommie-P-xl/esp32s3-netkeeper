@@ -52,6 +52,7 @@
   - [13. 构建期配置（`sdkconfig.defaults` 里几个非默认项）](#13-构建期配置sdkconfigdefaults-里几个非默认项)
   - [14. 踩过的坑（按"症状 → 根因"记）](#14-踩过的坑按症状--根因记)
   - [15. 想换成别的 Portal 系统（Dr.COM / 华为 / 锐捷）](#15-想换成别的-portal-系统drcom--华为--锐捷)
+- [附录：2026-11 这一轮改了什么](#附录2026-11-这一轮改了什么)
 - [许可](#许可)
 
 ## 界面预览
@@ -315,8 +316,12 @@ copy ui_font_18.c ..\..\main\ui_font_18.c
 |---|---|
 | 电池供电（拔了 USB） | `电池 62% · 3h20m` —— 剩下的百分比 + 预计还能用多久 |
 | USB 在位、正在充电 | `电池 87% · 充电中` —— 只报电量，**不估续航**（充电时电流方向相反，估算没有意义） |
-| 充满、USB 仍在 | `电池 100% · 已充满` |
+| 充满后已停充 | `电池 100% · 已充满` |
+| 接了电源但没在充（满电待机、限流等） | `电池 98% · 已接电源` |
 | 没插电池 | 不显示 |
+
+后三种都是"USB 在位"，区别在 AXP2101 的充电状态位（`0x01[7:5]`：0 待机 / 1 充电 / 3 充满），
+所以界面不会把"停充"说成"充电中"。
 
 续航是按**当前功耗状态**估的：亮屏约 120 mA、熄屏约 45 mA、熄屏降频约 28 mA。
 AXP2101 没有电池电流 ADC，所以这是模型估算而不是实测——`APP_BATTERY_MAH`
@@ -809,6 +814,53 @@ ADC 读数接近 0。比"检测电池 NTC"之类的方案省事，且误判率�
 
 `net_guard.c`、`db.c`、`web.c`、UI 全部与协议无关，一行都不用动——它们只关心
 "`probe` 说要不要认证、`login` 说成没成功"。
+
+## 附录：2026-11 这一轮改了什么
+
+按"加功能 → 撞坑 → 定性 → 修"的顺序记一遍。每条都附上现场证据，方便以后遇到类似现象时对号入座。
+
+### 新增的能力
+
+| 能力 | 落点 | 说明 |
+|---|---|---|
+| 电池电量 + 续航估计 | `batt_mgr.c` | 读 AXP2101（I2C 0x34）的 VBAT 与充放电状态位；没有电流 ADC，续航按功耗模型估 |
+| 充电状态三档 | `ui.c` + `batt_mgr.c` | `充电中` / `已充满` / `已接电源`，不再只看"USB 在位" |
+| 烧录后自动复位 | `flash.ps1` | 写入用 `no-reset`，成功后单独发一次 `watchdog-reset`，避免烧完停在下载模式 |
+| 抓图不再阻塞界面 | `ui.c` | 快照留在 LVGL 线程（几十毫秒），hex 发送交给独立 `fbdump` 任务 |
+| 空闲诊断开关 | `APP_IDLE_DEBUG` | 打开后每 2 秒打一行 `idle / int_low / press / screen`，定位"不熄屏"这类问题全靠它 |
+
+### 踩的坑
+
+| 症状 | 根因 | 修法 |
+|---|---|---|
+| 插着充电器时屏幕不熄，或熄灭后立刻又亮 | 老代码拿触摸 **INT 电平**当"有活动"。CST9217 会把 INT 拉住直到报告被读走，这个状态一旦卡住（充电噪声、熄屏后没人读），空闲计时被每 10 ms 刷新一次 | 唤醒只认 **高→低边沿**（且熄灭 >300 ms）；活动必须 **INT 低 + `lv_indev_get_state()==PRESSED`**。详见[第 11 节](#11-电源管理power_mgrc) |
+| 抓图那几分钟里时钟、倒计时全冻住，熄屏也推迟 | 整屏 hex 直接在 `lv_timer` 回调里写串口，一屏 90 秒，LVGL 任务被占死 | 快照与发送拆成两个任务；抓图期间界面照常动 |
+| 抓图过程中板子突然重启，整个序列报废 | `assert failed: spi_device_release_bus`——快照触发离屏渲染，与面板在途的 QSPI 刷新撞车 | 快照前 `lv_refr_now(NULL)` + 30 ms，把在途刷新收干净 |
+| GitHub 上看到的截图一直是旧的 | 图生成到了项目根 `docs/images/`，而 README 引用 `portal_guard/docs/images/`，`git add` 静默跳过 | 固定用 `_mk_shots.py` 只往仓库目录写；提交后 `curl 远端 \| md5sum` 与本地逐张比对 |
+| 截图下半截全黑 | 串口无流控，某一行少了 32 个像素；PNG 每行必须定长，短行让解码器错位 | 短行补黑并打印 `padded N short row(s)`（丢的总在行尾，那块本来就是背景） |
+| 主页首图是 `LINKING / 未联网 / 运行时长 00:02` | 抓图定时器设在开机 3 秒 | 延后到 30 秒，等连网 + SNTP 校时完成 |
+| 电池 98% 已停充，界面却写"充电中" | 只判断"USB 在位"，没看 AXP2101 的充电状态位（0 待机 / 1 充电 / 3 充满） | 按状态位分三档，见上表 |
+| 烧完屏幕全黑、串口一个字都没有 | EN 没接 USB 的 RTS，`--after hard-reset` 是空操作，芯片停在 ROM 下载模式 | `flash.ps1` 追加 `watchdog-reset`；仍不行就长按 PWR |
+| 编译时一堆 `lv_obj_remove_flag is deprecated` | LVGL 9.6 把 flag API 换成了"一个 flag 一个 setter" | `ui_common.h` 用 `LV_VERSION_CHECK` 包一层 `ui_obj_*`，新旧版本都不告警 |
+
+### 这一轮的验证证据
+
+插着 USB 充电的串口实测（240 秒窗口，无重启）：
+
+```
+I (124381) power_mgr: cpu clock -> 240 MHz          ← 触摸唤醒生效
+I (134424) power_mgr: no touch for 10 s, panel off  ← 熄屏
+I (194424) power_mgr: no touch for 70 s, idle: cpu 80 MHz, panel off
+I (194428) power_mgr: cpu clock -> 80 MHz           ← 休眠
+```
+
+`/api/state` 同步暴露了电池状态，可以直接用 curl 核对界面显示：
+
+```bash
+curl -s http://<板子IP>/api/state | python -m json.tool
+# bat_present / bat_pct / bat_mv / bat_usb / bat_charging / bat_min
+# 98% 停充时：bat_usb=true, bat_charging=false → 界面显示「已接电源」
+```
 
 ## 许可
 
