@@ -12,6 +12,7 @@
 
 #include "bsp/esp-bsp.h"
 #include "bsp/display.h"
+#include "ui_common.h"   /* ui_lock / ui_unlock：查 LVGL 的触摸状态要用显示锁 */
 #include "app_config.h"
 
 static const char *TAG = "power_mgr";
@@ -121,20 +122,64 @@ static void enter_low_power(void)
 
 /* -------------------------------------------------------------- supervisor */
 
+/* 是否"真的按下了"。
+ *
+ * 不能拿触摸 INT 的电平当活动依据：INT 被拉低有两种原因——真实触摸，
+ * 以及报告还没被读走。这块屏在充电时面板噪声会让触摸芯片不断产生报告，
+ * INT 几乎一直是低的；老代码用 level 刷新空闲计时，结果插着 USB 就永远不熄屏。
+ *
+ * 现在只认 LVGL 那边"按下"的状态：噪声不会让触摸芯片报出真实坐标，
+ * 所以不会误判。INT 仍是廉价的门控——只有它低的时候才去问 LVGL。 */
+static bool any_indev_pressed(void)
+{
+    bool pressed = false;
+
+    if (!ui_lock(20)) {
+        return false;
+    }
+    for (lv_indev_t *i = lv_indev_get_next(NULL); i != NULL; i = lv_indev_get_next(i)) {
+        if (lv_indev_get_state(i) == LV_INDEV_STATE_PRESSED) {
+            pressed = true;
+            break;
+        }
+    }
+    ui_unlock();
+    return pressed;
+}
+
 static void power_task(void *arg)
 {
     (void)arg;
 
+    /* 唤醒用「高 -> 低」的边沿，不用电平：
+     * 触摸芯片会把 INT 拉住直到报告被读走，一旦这状态卡住（充电噪声、丢读），
+     * 用电平判断就会一直认为"有人碰着"，屏幕永远不熄、熄了也立刻被点亮。
+     * 边沿只在真的按下那一刻出现，卡低时没有边沿，也就不会反复唤醒。 */
+    bool int_prev_low = (gpio_get_level(BSP_LCD_TOUCH_INT) == 0);
+    TickType_t blank_tick = 0;
+
+#if APP_IDLE_DEBUG
+    uint32_t dbg_low = 0, dbg_press = 0;
+    TickType_t dbg_t0 = xTaskGetTickCount();
+#endif
+
     for (;;) {
         TickType_t now = xTaskGetTickCount();
 
-        /* Level, not edge: the CST9217 keeps INT asserted until the host reads
-         * the report, and nothing reads it while the panel is blanked. */
-        if (gpio_get_level(BSP_LCD_TOUCH_INT) == 0) {
-            s_last_activity = now;
-            if (!s_screen_on) {
-                panel_on();
+        const bool int_low = (gpio_get_level(BSP_LCD_TOUCH_INT) == 0);
+        const bool falling = int_low && !int_prev_low;
+        int_prev_low = int_low;
+
+        if (s_screen_on) {
+            /* 亮屏时：只有 LVGL 那边真的"按下"才算活动。
+             * 用 INT 电平的话，卡低会让空闲计时被无限刷新（插着 USB 就永不熄屏）。 */
+            if (int_low && any_indev_pressed()) {
+                s_last_activity = now;
             }
+        } else if (falling && (now - blank_tick) >= pdMS_TO_TICKS(300)) {
+            /* 熄屏后留 300 ms 死区：刚熄灭时手还在屏上，避免刚黑就亮 */
+            panel_on();
+            s_last_activity = now;
         }
 
         uint32_t idle_ms = (uint32_t)(now - s_last_activity) * portTICK_PERIOD_MS;
@@ -142,10 +187,28 @@ static void power_task(void *arg)
         if (s_screen_on) {
             if (idle_ms >= IDLE_TO_BLANK_MS) {
                 panel_off();
+                blank_tick = now;
             }
         } else if (!s_low_power && idle_ms >= IDLE_TO_BLANK_MS + BLANK_TO_IDLE_MS) {
             enter_low_power();
         }
+
+#if APP_IDLE_DEBUG
+        if (int_low) {
+            dbg_low++;
+        }
+        if (s_screen_on && int_low && any_indev_pressed()) {
+            dbg_press++;
+        }
+        if (now - dbg_t0 >= pdMS_TO_TICKS(2000)) {
+            ESP_LOGI(TAG, "idle=%lums int_low=%lu press=%lu screen=%d",
+                     (unsigned long)idle_ms, (unsigned long)dbg_low,
+                     (unsigned long)dbg_press, (int)s_screen_on);
+            dbg_low = 0;
+            dbg_press = 0;
+            dbg_t0 = now;
+        }
+#endif
 
         vTaskDelay(pdMS_TO_TICKS(POLL_MS));
     }

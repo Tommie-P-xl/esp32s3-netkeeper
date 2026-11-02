@@ -74,3 +74,5 @@
 #define APP_UI_CAPTURE_SETUP      0
 /* 显存 dump 的降采样倍数：2 = 半分辨率(240x240，快)；1 = 原分辨率 480x480(清晰，慢) */
 #define APP_UI_DUMP_STEP          1
+/* 空闲检测调试：每 2 秒打一行 int_low / press 计数 + 当前 idle 时间（默认关） */
+#define APP_IDLE_DEBUG            0
