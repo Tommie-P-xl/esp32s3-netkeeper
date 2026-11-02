@@ -2,8 +2,8 @@
 # CMakeLists in this exact order for cmake to work correctly
 cmake_minimum_required(VERSION 3.5)
 
-set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${CMAKE_CURRENT_LIST_DIR}/version")
-file(READ "${CMAKE_CURRENT_LIST_DIR}/version" PROJECT_VER)
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${CMAKE_CURRENT_LIST_DIR}/VERSION")
+file(READ "${CMAKE_CURRENT_LIST_DIR}/VERSION" PROJECT_VER)
 string(STRIP "${PROJECT_VER}" PROJECT_VER)
 
 include($ENV{IDF_PATH}/tools/cmake/project.cmake)
@@ -16,5 +16,5 @@ add_compile_options(-Wno-format)
 project(esp32s3_netkeeper)
 
 if(CONFIG_APP_PROJECT_VER_FROM_CONFIG)
-    message(FATAL_ERROR "Disable CONFIG_APP_PROJECT_VER_FROM_CONFIG; the project version comes from the version file")
+    message(FATAL_ERROR "Disable CONFIG_APP_PROJECT_VER_FROM_CONFIG; the project version comes from the VERSION file")
 endif()

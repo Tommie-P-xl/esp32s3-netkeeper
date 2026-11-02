@@ -152,6 +152,25 @@ void wifi_mgr_ssid(char *out, size_t cap)
     strlcpy(out, s_ssid, cap);
 }
 
+bool wifi_mgr_current_credentials(char *ssid, size_t scap, char *pass, size_t pcap)
+{
+    wifi_ap_record_t ap;
+    wifi_config_t cfg;
+    if (!s_connected || esp_wifi_sta_get_ap_info(&ap) != ESP_OK ||
+        esp_wifi_get_config(WIFI_IF_STA, &cfg) != ESP_OK || !s_connected ||
+        strncmp((const char *)ap.ssid, (const char *)cfg.sta.ssid, 32) != 0) {
+        return false;
+    }
+    /* 驱动中的 SSID 可以正好占满 32 字节，不能假定有结尾零。 */
+    char name[33] = {0};
+    char password[65] = {0};
+    memcpy(name, ap.ssid, 32);
+    memcpy(password, cfg.sta.password, 64);
+    strlcpy(ssid, name, scap);
+    strlcpy(pass, password, pcap);
+    return true;
+}
+
 int wifi_mgr_scan(wifi_ap_t *out, int max)
 {
     if (out == NULL || max <= 0) {

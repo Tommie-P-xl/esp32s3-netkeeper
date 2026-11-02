@@ -6,6 +6,9 @@
 
 检测外网 → 掉线自动重认证 → 5 分钟轮询 → 屏幕上看得见状态
 
+当前版本见 [VERSION](VERSION) · 支持 SD / Flash 实时同步、SD 热插拔与活跃网络保护，
+完整更新记录见 [CHANGELOG.md](CHANGELOG.md)。
+
 [![License](https://img.shields.io/badge/License-MIT-3DA639.svg?style=flat-square)](LICENSE)
 [![ESP-IDF](https://img.shields.io/badge/ESP--IDF-v6.1-E7352C.svg?style=flat-square&logo=espressif&logoColor=white)](https://github.com/espressif/esp-idf)
 [![LVGL](https://img.shields.io/badge/LVGL-9.6-2C3E50.svg?style=flat-square)](https://lvgl.io)
@@ -114,7 +117,8 @@
 - **网页验证码防护**：屏幕实时显示 6 位验证码（5 分钟换新）+ 倒计时，
   网页修改配置前必须先验证；已解锁的浏览器会话不受换码影响（7 天内有效）。
 - **系统时钟**：所有界面顶部显示时间，联网后 SNTP 自动校时（东八区）。
-- **双存储**：片上 NVS + SD 卡镜像，**SD 优先**（见下）。
+- **双存储与热插拔**：片上 NVS + SD 卡同步，**有效 SD 优先，保留当前联网 WiFi**；
+  后台约每秒检测拔插，熄屏和 80 MHz 省电状态照常处理（见下）。
 - **自愈**：目标网络连不上会自动回退到上次成功的、或库里其它网络，
   不会因为填错一个 SSID 就把板子锁死。
 - **省电**：10 秒无触摸熄屏，再 60 秒把 CPU 降到 80 MHz；触摸即亮。
@@ -173,22 +177,25 @@
 | 触发 | 做什么 |
 |---|---|
 | push 到 `main` / PR | 在 `espressif/idf:v6.1` 容器里跑 `idf.py build`，同时打印告警数；产物上传成 Actions artifact（保留 30 天） |
-| 推与 `version` 文件一致的 `v*` tag | **先编译**，成功后创建或更新 Release 并上传固件 |
+| 推与 `VERSION` 文件一致的 `v*` tag | **先编译**，成功后创建或更新 Release 并上传固件 |
 
 > [!NOTE]
 > Release 中提供固件压缩包和独立的 bin 文件；Actions artifact 也保留构建产物。
 
-项目版本只在仓库根目录的 `version` 文件中维护；固件版本、发布标签和 Release 标题均从它取得。
+项目版本只在仓库根目录的 `VERSION` 文件中维护；固件版本、发布标签和 Release 标题均从它取得。
 修改该文件并提交后，运行：
 
 ```bash
-tag="v$(tr -d '\r\n' < version)"
+tag="v$(tr -d '\r\n' < VERSION)"
 git tag -a "$tag" -m "$tag"
 git push origin "$tag"     # 推完 Actions 会自动发布 Release
 ```
 
 版本之间改了什么记在 [CHANGELOG.md](CHANGELOG.md) 里（本 README 只讲"现在是怎么做的"，
 不堆历史）；发版时同步在那边加一节。
+
+本地测试代码、实机配置备份、日志、构建目录及代码索引均不提交到源码仓库；
+`.gitignore` 已排除这些内容。仓库保留正式源码、文档和原有构建发布流程。
 
 ---
 
@@ -203,38 +210,54 @@ flowchart LR
     NVS -.->|"内容始终一致"| SD
 ```
 
-**开机加载顺序**
+**开机、重载及插卡时的加载顺序**
 
 ```mermaid
 flowchart TD
     B([开机]) --> Q1{"SD 卡挂载成功？"}
     Q1 -- 否 --> N1["只读 NVS"]
     Q1 -- 是 --> Q2{"卡上有 net.cfg 且能解析？"}
-    Q2 -- 是 --> S1["以 SD 为准，覆盖 NVS"]
+    Q2 -- 是 --> S1["以 SD 为准，保留当前联网 WiFi 后同步两处"]
     Q2 -- 否 --> Q3{"NVS 里有配置？"}
     Q3 -- 是 --> N2["用 NVS，顺手补写一份到 SD"]
     Q3 -- 否 --> D1["用编译期默认值播种（NVS + SD 都写）"]
 ```
 
-- 没插卡：完全正常，配置只在片上 Flash。
-- 插了卡：配置同时写两处，卡是备份；把卡拿到电脑上改完插回来，重启就生效。
-- "能解析"的判定：至少有一个 `[SSID]` 段或至少一行 `active=`。
-  所以卡里被存成乱码不会顶掉 Flash 里的配置。
-- 网页上的「从 SD 恢复」可以强制用卡覆盖 Flash。
+- 没插卡或运行中拔卡：使用片上 Flash；修改立即写入 Flash。
+- 插入卡：有效 `/portal/net.cfg` 优先；缺失、仅有注释或损坏时，用 Flash 数据重建卡上配置。
+  运行中直接修改卡上文件也会在下一次检测时加载，拿读卡器改完再插回不需要重启。
+- 每次配置修改立即同步两处；写失败返回错误并在后台重试。检测无变化时不重复写 Flash。
+- **活跃网络例外**：同步时若 WiFi 已关联并取得 IP，保留该网络的实际 WiFi 密码、全部校园网
+  账号密码及当前选中账号，并继续以它为联网目标。Flash 为 ABC、当前连接 A、SD 为 DEF 时，
+  最终两处都是 **ADEF**；B、C 不保留。SD 也含 A 且内容冲突时，同样保留正在使用的 A 信息。
+  未连接时无此例外，最终两处为 DEF。这里按 WiFi 已取得 IP 判断，不要求外网探测刚刚成功。
+- 网页「重载配置」「从 SD 恢复」遵守同样的活跃网络保护；无效 SD 的强制恢复返回错误。
+  当前联网网络不能直接删除，可先切换网络再删除；账号的主动增删改仍正常同步。
+- 有效数据库要求段名、WiFi 字段、账号格式与引用完整；超长、截断或部分损坏的文件不会覆盖
+  Flash。显式空库可写为 `[general]` 加 `active=`。同步后文件会重写为标准格式。
+- 数据上限仍为 16 个网络、每网 8 个账号、文本 4000 字节。SD 已满而无法保留活跃网络，
+  或合并后文本超限时，拒绝本次导入并记录错误，不擅自丢弃任一网络。
+- 拔插由独立 FreeRTOS 任务约每秒探测，实际延迟还包含卡命令超时和挂载时间；不依赖屏幕刷新。
+  支持当前默认的熄屏及 80 MHz 降频模式。源码中关闭的实验性手动 light-sleep 分支不在此范围。
 
 ### 文件格式（`/portal/net.cfg`，UTF-8）
 
 ```ini
 # 井号开头是注释
 [general]
-active=MyHomeWiFi        ; 开机自动连的 WiFi，也是守护目标
-last_ok=MyHomeWiFi       ; 上次成功的网络，自动维护，不用手改
+# 开机自动连的 WiFi，也是守护目标
+active=MyHomeWiFi
+# 上次成功的网络，自动维护，不用手改
+last_ok=MyHomeWiFi
 
 [MyHomeWiFi]             ; 段名就是 SSID，可以带空格
-wifi=wifi密码            ; 开放网络留空
-current=20230000000      ; 当前使用的认证账号
+# 开放网络留空
+wifi=wifi密码
+# 当前使用的认证账号
+current=20230000000
 account=20230000000|密码1
-account=13800000000|密码2 ; 一个 SSID 下可以写多行
+# 一个 SSID 下可以写多行
+account=13800000000|密码2
 ```
 
 容量上限 4000 字节（NVS 单条 blob 限制），够放十几组网络。
@@ -280,7 +303,7 @@ http://192.168.x.x/
 | POST | `/api/remove` | `token`,`type=wifi\|acct`,`ssid`,`user` | 删除 |
 | POST | `/api/check` | `token` | 立即检测 |
 | POST | `/api/reload` | `token` | 重载配置 |
-| POST | `/api/restore` | `token` | 用 SD 覆盖 Flash |
+| POST | `/api/restore` | `token` | 导入有效 SD 到 Flash，保留活跃网络 |
 
 写接口缺少或 token 失效时返回 `{"ok":false,"need_auth":true}`。
 连错 5 次验证码会锁 60 秒。
@@ -455,6 +478,7 @@ flowchart LR
 |---|---|---|---|---|
 | `main` | IDF | 6144 | 初始化，建完各任务就退出循环 | — |
 | `net_guard` | `app_main` | 8192 | 连 WiFi、探外网、认证、退避 | `vTaskDelay(500)` / 信号量 |
+| `db_sd` | `db_init` | 6144 | 探测 SD 拔插、重新挂载、同步配置及重试写入 | `vTaskDelay(1000)` / 配置锁 |
 | LVGL task | `esp_lv_adapter` | BSP 默认 | 跑 `lv_timer_handler`、重绘 | 显示锁 + 刷新周期 15 ms |
 | `httpd` | `web_start` | 默认 | 接受 HTTP 连接 | socket |
 | `power_mgr` | `power_mgr_start` | 默认 | 10 ms 轮询触摸 INT、管熄屏 | `vTaskDelay(10)` |
@@ -479,7 +503,7 @@ nvs_flash_init()          配置库要存 NVS
 esp_netif_init()          协议栈
 esp_event_loop_create()   事件循环，WiFi 事件要投递到这里
 sys_time_init()           设东八区（校时等拿到 IP 再说）
-db_init()                 挂 SD、加载配置；此时才知道"有没有卡"
+db_init()                 挂 SD、加载配置，启动 SD 热插拔与同步后台任务
 power_mgr_display_start() QSPI 初始化 + LVGL 起来，返回 lv_display_t*
 ui_create()               ★ 建主界面，用户此刻开始看到东西
 boot_hint (2.5 s 后)      没配网就直接把"选 WiFi"页推上去；没插卡弹提示
@@ -661,10 +685,15 @@ GET /cgi-bin/srun_portal?callback=jsonp&action=login
 改内存 → 序列化成文本 → 写 NVS（一个 blob）→ 写 SD（net.tmp → rename）
 ```
 
-**用 tmp + rename 而不是直接覆盖**：SD 卡掉电时直接写原文件会留半截，
-rename 在同一文件系统内是原子的，最坏情况是"新文件没生成、旧文件还在"。
+SD 写入先完成 `net.tmp` 并检查写入及关闭结果，再替换 `net.cfg`。FAT 替换旧文件需要
+先删除旧路径，因此不承诺掉电原子性；重启时缺失或损坏的配置由 Flash 重建。
+Flash 写失败和 SD 写失败分别保留重试状态，SD 成功后才更新其同步标记。
 
-读的时候 SD 优先，四个分支见前面「[配置存在哪](#配置存在哪谁优先)」一节。
+本次修复了空卡备份只剩第一行注释的问题：INI 解析会就地修改文本缓冲区，
+因此每次写卡都先重新序列化完整数据库。后台 `db_sd` 任务与界面刷新独立，
+每秒检查卡状态；拔卡切到 Flash，插卡按有效 SD 优先规则同步，并保留活跃网络。
+
+读的时候有效 SD 优先，并保留当前联网网络，分支见前面「[配置存在哪](#配置存在哪谁优先)」一节。
 `db_read_begin()/db_read_end()` 是给"要连着读好几个字段"的场景用的
 （比如遍历网络列表建 UI），期间别调写接口，否则 mutex 自锁。
 
@@ -684,7 +713,7 @@ rename 在同一文件系统内是原子的，最坏情况是"新文件没生成
 | `/api/remove` | POST | 是 | 删网络或账号 |
 | `/api/check` | POST | 是 | 立即检测 |
 | `/api/reload` | POST | 是 | 重载 SD 配置 |
-| `/api/restore` | POST | 是 | SD 覆盖 Flash |
+| `/api/restore` | POST | 是 | 有效 SD 同步至 Flash，保留活跃网络 |
 
 **为什么只读接口不鉴权**：看一眼状态不该要验证码，否则分享给室友看"网通没通"都麻烦；
 真正会改数据的才拦。
@@ -888,7 +917,7 @@ ADC 读数接近 0。比"检测电池 NTC"之类的方案省事，且误判率�
 | 网络判定 | `generate_204` 探测 + 302 抓 `ac_id` | 不解析登录页 HTML（学校一改版就崩）；不写死 Portal 域名（NAT 后面取到的 `client_ip` 更可靠） |
 | 认证成功判定 | 登录返回 ok **后**再探一次外网 | 只信 Portal 的返回值会踩"返回成功但没放行"（限速、欠费、设备数超限），多一次 GET 换来状态可信 |
 | UI 线程模型 | LVGL 单任务 + 一把递归锁 | 不用"每屏一个任务"：LVGL 不是线程安全的，多任务只会把竞态藏得更深；也不用全局无锁，跨任务的写最终会打架 |
-| 配置存储 | NVS + SD 双写，SD 优先 | 只存 NVS 的话，改配置必须重烧；只用 SD 的话，没插卡就不能用。双写 + 人可读 INI 让"读卡器改完插回来重启"成为一条正式路径 |
+| 配置存储 | NVS + SD 双写，SD 优先 | 只存 NVS 的话，改配置必须重烧；只用 SD 的话，没插卡就不能用。双写 + 人可读 INI 支持读卡器修改后热插回板子，活跃网络仍保留 |
 | 电量计算 | AXP2101 电压查表 + 充电补偿 | AXP2101 有 E-Gauge（`0xA4`），但没做电池标定时读数不可信，所以**不采信**它，用确定性更强的电压曲线 |
 | 续航估计 | 按工作状态取电流的功耗模型 | AXP2101 **没有电流 ADC**，库仑计也不存在；与其编一个"精确"数字，不如明确写成"约 XhYYm"并把三个电流常量暴露在 `app_config.h` 里 |
 | 中文字体 | 从系统黑体按源码用字生成子集（约 730 KB） | LVGL 自带 CJK 字体是偏日文的子集，缺「网/认/证/检/测」；全量 CJK 十几 MB 不适合 8 MB app 分区。生成物入库，保证 clone 后不装 Node 也能编 |

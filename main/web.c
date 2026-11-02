@@ -464,13 +464,19 @@ static esp_err_t h_wifi(httpd_req_t *req)
     if (!exists) {
         /* 新网络：先存下来试连，连上才切过去 —— 否则加错 SSID 会把正在用的
          * 网络踢掉，网页也跟着失联。 */
-        db_ensure_net(ssid, has_pass ? pass : "");
+        if (!db_ensure_net(ssid, has_pass ? pass : "")) {
+            return reply(req, false, "网络数量已达上限或存储失败");
+        }
         net_guard_try_ssid(ssid);
     } else if (has_pass) {
-        db_ensure_net(ssid, pass);
+        if (!db_ensure_net(ssid, pass)) {
+            return reply(req, false, "保存失败，请检查存储状态");
+        }
         net_guard_try_ssid(ssid);
     } else if (want_use) {
-        db_set_active_ssid(ssid);
+        if (db_set_active_ssid(ssid) != ESP_OK) {
+            return reply(req, false, "保存失败，请检查存储状态");
+        }
         net_guard_trigger();
     } else {
         net_guard_trigger();
@@ -556,7 +562,10 @@ static esp_err_t h_remove(httpd_req_t *req)
     }
 
     net_guard_trigger();
-    return reply(req, err == ESP_OK, err == ESP_OK ? "ok" : "没找到对应条目");
+    if (err == ESP_ERR_INVALID_STATE) {
+        return reply(req, false, "当前网络正在使用，请先切换网络");
+    }
+    return reply(req, err == ESP_OK, err == ESP_OK ? "ok" : "条目不存在或存储失败");
 }
 
 static esp_err_t h_check(httpd_req_t *req)

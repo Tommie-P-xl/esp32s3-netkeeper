@@ -1,7 +1,7 @@
 name: build
 
 # 每次 push 到 main / PR 都编译一遍（防止"本地能过、别人拉下来编不过"）；
-# 打与 version 文件一致的 v* tag 时发布固件。
+# 打与 VERSION 文件一致的 v* tag 时发布固件。
 on:
   push:
     branches: [main]
@@ -27,10 +27,10 @@ jobs:
       - name: Validate project version
         shell: bash
         run: |
-          version=$(tr -d '\r\n' < version)
-          [[ "$version" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] || { echo "Invalid version file" >&2; exit 1; }
+          version=$(tr -d '\r\n' < VERSION)
+          [[ "$version" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] || { echo "Invalid VERSION file" >&2; exit 1; }
           if [[ "$GITHUB_REF" == refs/tags/* && "$GITHUB_REF_NAME" != "v${version}" ]]; then
-            echo "Tag must match v${version} from the version file" >&2
+            echo "Tag must match v${version} from the VERSION file" >&2
             exit 1
           fi
 
@@ -62,7 +62,7 @@ jobs:
           python3 - <<'PY'
           from pathlib import Path
           image = Path('build/esp32s3_netkeeper.bin').read_bytes()
-          expected = Path('version').read_text().strip()
+          expected = Path('VERSION').read_text().strip()
           if image[32:36] != bytes.fromhex('3254cdab'):
               raise SystemExit('ESP application description not found')
           actual = image[48:80].split(b'\0', 1)[0].decode('ascii')
@@ -106,7 +106,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          version=$(tr -d '\r\n' < version)
+          version=$(tr -d '\r\n' < VERSION)
           python3 - <<'PY'
           from pathlib import Path
           from zipfile import ZIP_DEFLATED, ZipFile

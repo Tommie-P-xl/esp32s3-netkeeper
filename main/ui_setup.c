@@ -101,10 +101,13 @@ static void row_ap_cb(lv_event_t *e)
 static void row_del_cb(lv_event_t *e)
 {
     const char *ssid = (const char *)lv_event_get_user_data(e);
-    if (db_remove_net(ssid) == ESP_OK) {
+    const esp_err_t err = db_remove_net(ssid);
+    if (err == ESP_OK) {
         ui_toast("已删除该网络");
         net_guard_trigger();
         start_scan();
+    } else if (err == ESP_ERR_INVALID_STATE) {
+        ui_toast("请先切换网络");
     } else {
         ui_toast("删除失败");
     }

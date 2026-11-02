@@ -9,6 +9,13 @@ sdkconfig.old
 flash_rc.txt
 rc.txt
 
+# Local validation, private configuration backups, and code index
+/tests/
+/.local/
+/.codegraph/
+__pycache__/
+*.pyc
+
 # managed components are re-fetched by the component manager from the manifests
 managed_components/
 

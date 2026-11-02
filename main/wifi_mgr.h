@@ -43,6 +43,9 @@ bool wifi_mgr_wait_ip(uint32_t timeout_ms);
 void wifi_mgr_ip(char *out, size_t cap);
 void wifi_mgr_ssid(char *out, size_t cap);
 
+/** @brief 已连接且取得 IP 时，复制实际关联网络及正在使用的密码。 */
+bool wifi_mgr_current_credentials(char *ssid, size_t scap, char *pass, size_t pcap);
+
 /** @brief 掉线后由 net_guard 调用，重新发起连接。 */
 void wifi_mgr_reconnect(void);
 

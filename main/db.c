@@ -1,6 +1,7 @@
 #include "db.h"
 
 #include <ctype.h>
+#include <errno.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -10,9 +11,14 @@
 #include "app_config.h"
 #include "bsp/esp-bsp.h"
 #include "esp_log.h"
+#include "esp_vfs_fat.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
+#include "freertos/task.h"
 #include "nvs.h"
+#include "sdmmc_cmd.h"
+#include "wifi_mgr.h"
+#include "net_guard.h"
 
 static const char *TAG = "db";
 
@@ -25,12 +31,42 @@ static int s_count;
 static char s_active[DB_SSID_LEN];
 static char s_last_ok[DB_SSID_LEN];
 static bool s_sd;
-static uint32_t s_sd_hash;      /* 最后一次与 SD 同步时的文本哈希 */
+static uint32_t s_sd_hash;      /* 只在 SD 成功读取/写入后更新 */
+static uint32_t s_nvs_hash;
+static bool s_nvs_synced;
+static bool s_sd_dirty;
+static bool s_loaded;
+static TaskHandle_t s_sd_task;
 static SemaphoreHandle_t s_mtx;
 static nvs_handle_t s_nvs;
 
 /* 序列化用的缓冲，避免每次改动都 malloc 4 KB */
 static char s_text[DB_TEXT_MAX];
+
+/* 导入或修改失败时回滚；全部受 s_mtx 保护，不占后台任务栈。 */
+typedef struct {
+    db_net_t nets[DB_MAX_NETS];
+    int count;
+    char active[DB_SSID_LEN];
+    char last_ok[DB_SSID_LEN];
+} db_snapshot_t;
+static db_snapshot_t s_before;
+
+static void snapshot_locked(void)
+{
+    memcpy(s_before.nets, s_nets, sizeof(s_nets));
+    s_before.count = s_count;
+    strlcpy(s_before.active, s_active, sizeof(s_active));
+    strlcpy(s_before.last_ok, s_last_ok, sizeof(s_last_ok));
+}
+
+static void rollback_locked(void)
+{
+    memcpy(s_nets, s_before.nets, sizeof(s_nets));
+    s_count = s_before.count;
+    strlcpy(s_active, s_before.active, sizeof(s_active));
+    strlcpy(s_last_ok, s_before.last_ok, sizeof(s_last_ok));
+}
 
 /* ------------------------------------------------------------- 小工具 */
 
@@ -147,12 +183,7 @@ static bool serialize_locked(void)
                 "# 段名就是 WiFi 名字，可以带空格；以 # 开头的行是注释。\n"
                 "\n[general]\n");
 
-    if (s_active[0] != '\0') {
-        sb_put(&sb, "active=%s\n", s_active);
-    }
-    if (s_last_ok[0] != '\0') {
-        sb_put(&sb, "last_ok=%s\n", s_last_ok);
-    }
+    sb_put(&sb, "active=%s\nlast_ok=%s\n", s_active, s_last_ok);
 
     for (int i = 0; i < s_count; i++) {
         const db_net_t *n = &s_nets[i];
@@ -183,16 +214,23 @@ static esp_err_t save_nvs_locked(void)
     }
 
     const size_t len = strlen(s_text) + 1;
+    const uint32_t hash = fnv1a(s_text);
+    if (s_nvs_synced && hash == s_nvs_hash) {
+        return ESP_OK;
+    }
+    s_nvs_synced = false;
     esp_err_t err = nvs_set_blob(s_nvs, NVS_KEY_CFG, s_text, len);
     if (err == ESP_OK) {
-        s_sd_hash = fnv1a(s_text);
-        err = nvs_set_u32(s_nvs, NVS_KEY_HASH, s_sd_hash);
+        err = nvs_set_u32(s_nvs, NVS_KEY_HASH, hash);
     }
     if (err == ESP_OK) {
         err = nvs_commit(s_nvs);
     }
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "nvs write failed: %s", esp_err_to_name(err));
+    } else {
+        s_nvs_hash = hash;
+        s_nvs_synced = true;
     }
     return err;
 }
@@ -202,6 +240,12 @@ static esp_err_t save_sd_locked(void)
     if (!s_sd) {
         return ESP_OK;
     }
+
+    /* 解析会修改 s_text，任何写卡入口都必须重新生成完整文本。 */
+    if (!serialize_locked()) {
+        return ESP_ERR_INVALID_SIZE;
+    }
+    s_sd_dirty = true;
 
     mkdir(DB_SD_DIR, 0775);
 
@@ -213,10 +257,10 @@ static esp_err_t save_sd_locked(void)
     }
 
     /* BOM：Windows 记事本打开中文注释不乱码，解析时跳过 */
-    fputs("\xEF\xBB\xBF", f);
+    const bool bom_ok = fputs("\xEF\xBB\xBF", f) >= 0;
     const size_t len = strlen(s_text);
     const size_t wr = fwrite(s_text, 1, len, f);
-    const bool ok = (fclose(f) == 0) && (wr == len);
+    const bool ok = (fclose(f) == 0) && (wr == len) && bom_ok;
     if (!ok) {
         ESP_LOGW(TAG, "sd write short");
         return ESP_FAIL;
@@ -227,17 +271,38 @@ static esp_err_t save_sd_locked(void)
         ESP_LOGW(TAG, "sd rename failed");
         return ESP_FAIL;
     }
+    s_sd_hash = fnv1a(s_text);
+    s_sd_dirty = false;
     return ESP_OK;
+}
+
+/* 先验证大小，禁止把截断配置写进任一介质。写失败由后台重试。 */
+static esp_err_t save_both_locked(void)
+{
+    if (!serialize_locked()) {
+        return ESP_ERR_INVALID_SIZE;
+    }
+    const esp_err_t flash = save_nvs_locked();
+    const esp_err_t sd = save_sd_locked();
+    return flash != ESP_OK ? flash : sd;
+}
+
+static esp_err_t commit_edit_locked(void)
+{
+    const esp_err_t err = save_both_locked();
+    if (err == ESP_ERR_INVALID_SIZE) {
+        rollback_locked();
+    }
+    return err;
 }
 
 esp_err_t db_save(void)
 {
     lock();
-    const esp_err_t e1 = save_nvs_locked();
-    const esp_err_t e2 = save_sd_locked();
+    const esp_err_t err = save_both_locked();
     unlock();
 
-    return (e1 != ESP_OK) ? e1 : e2;
+    return err;
 }
 
 /* ---------------------------------------------------------------- 解析 */
@@ -246,6 +311,7 @@ static void seed_defaults_locked(void)
 {
     s_count = 0;
     memset(s_nets, 0, sizeof(s_nets));
+    s_last_ok[0] = '\0';
 
     db_net_t *n = net_ensure_locked(APP_WIFI_SSID);
     if (n != NULL) {
@@ -264,229 +330,309 @@ static void seed_defaults_locked(void)
  * 解析一段文本。直接就地改 buf（把 '=' 和 ']' 变成 '\0'），所以传进来的
  * 必须是自己独占的副本。
  */
-static void parse_text_locked(char *buf)
+static bool parse_text_locked(char *buf)
 {
     memset(s_nets, 0, sizeof(s_nets));
     s_count = 0;
     s_active[0] = '\0';
-
+    s_last_ok[0] = '\0';
     db_net_t *cur = NULL;
+    bool general = false, saw_general = false, saw_active = false;
+    bool saw_wifi[DB_MAX_NETS] = {0};
+    if (strncmp(buf, "\xEF\xBB\xBF", 3) == 0) {
+        buf += 3;
+    }
     char *save = NULL;
-
-    for (char *line = strtok_r(buf, "\n", &save); line != NULL;
+    for (char *line = strtok_r(buf, "\n", &save); line;
          line = strtok_r(NULL, "\n", &save)) {
-        char *p = line;
-
-        /* 首行可能带 UTF-8 BOM */
-        if ((unsigned char)p[0] == 0xEF && (unsigned char)p[1] == 0xBB &&
-            (unsigned char)p[2] == 0xBF) {
-            p += 3;
-        }
-
-        p = str_trim(p);
-        if (*p == '\0' || *p == '#' || *p == ';' || *p == '\r') {
+        char *p = str_trim(line);
+        if (!*p || *p == '#' || *p == ';') {
             continue;
         }
-
         if (*p == '[') {
             char *close = strchr(p, ']');
-            if (close == NULL) {
-                continue;
-            }
+            if (!close) { return false; }
             *close = '\0';
+            char *tail = str_trim(close + 1);
+            if (*tail && *tail != '#' && *tail != ';') { return false; }
             char *name = str_trim(p + 1);
-            if (strcasecmp(name, "general") == 0) {
-                cur = NULL;
-            } else if (name[0] != '\0') {
+            general = strcasecmp(name, "general") == 0;
+            cur = NULL;
+            if (general) {
+                if (saw_general) { return false; }
+                saw_general = true;
+            } else {
+                if (!*name || strlen(name) >= DB_SSID_LEN || net_find_locked(name)) {
+                    return false;
+                }
                 cur = net_ensure_locked(name);
+                if (!cur) { return false; }
             }
             continue;
         }
-
         char *eq = strchr(p, '=');
-        if (eq == NULL) {
-            continue;
-        }
+        if (!eq) { return false; }
         *eq = '\0';
-        char *key = str_trim(p);
-        char *val = str_trim(eq + 1);
-
-        if (strcasecmp(key, "active") == 0) {
-            strlcpy(s_active, val, sizeof(s_active));
-            continue;
-        }
-        if (strcasecmp(key, "last_ok") == 0) {
-            strlcpy(s_last_ok, val, sizeof(s_last_ok));
-            continue;
-        }
-        if (cur == NULL) {
-            continue;
-        }
-
-        if (strcasecmp(key, "wifi") == 0 || strcasecmp(key, "wifi_pass") == 0 ||
-            strcasecmp(key, "password") == 0) {
+        char *key = str_trim(p), *val = str_trim(eq + 1);
+        if (general) {
+            if (strlen(val) >= DB_SSID_LEN) { return false; }
+            if (strcasecmp(key, "active") == 0) {
+                strlcpy(s_active, val, sizeof(s_active));
+                saw_active = true;
+            } else if (strcasecmp(key, "last_ok") == 0) {
+                strlcpy(s_last_ok, val, sizeof(s_last_ok));
+            } else { return false; }
+        } else if (!cur) {
+            return false;
+        } else if (strcasecmp(key, "wifi") == 0 || strcasecmp(key, "wifi_pass") == 0 ||
+                   strcasecmp(key, "password") == 0) {
+            if (strlen(val) >= DB_PASS_LEN) { return false; }
             strlcpy(cur->wifi_pass, val, sizeof(cur->wifi_pass));
+            saw_wifi[cur - s_nets] = true;
         } else if (strcasecmp(key, "current") == 0) {
+            if (strlen(val) >= DB_USER_LEN) { return false; }
             strlcpy(cur->current, val, sizeof(cur->current));
         } else if (strcasecmp(key, "account") == 0) {
             char *bar = strchr(val, '|');
-            if (bar == NULL) {
-                continue;
-            }
+            if (!bar) { return false; }
             *bar = '\0';
-            char *user = str_trim(val);
-            char *pass = str_trim(bar + 1);
-            if (*user == '\0' || cur->acct_count >= DB_MAX_ACCT) {
-                continue;
+            char *user = str_trim(val), *pass = str_trim(bar + 1);
+            if (!*user || strlen(user) >= DB_USER_LEN || strlen(pass) >= DB_PASS_LEN ||
+                cur->acct_count >= DB_MAX_ACCT || acct_find_locked(cur, user) >= 0) {
+                return false;
             }
-            db_acct_t *a = &cur->acct[cur->acct_count++];
-            strlcpy(a->user, user, sizeof(a->user));
-            strlcpy(a->pass, pass, sizeof(a->pass));
+            db_acct_t *acct = &cur->acct[cur->acct_count++];
+            strlcpy(acct->user, user, sizeof(acct->user));
+            strlcpy(acct->pass, pass, sizeof(acct->pass));
+        } else { return false; }
+    }
+    for (int i = 0; i < s_count; ++i) {
+        if (!saw_wifi[i] || (s_nets[i].current[0] &&
+            acct_find_locked(&s_nets[i], s_nets[i].current) < 0)) {
+            return false;
         }
     }
+    if (s_active[0] && !net_find_locked(s_active)) { return false; }
+    if (s_last_ok[0] && !net_find_locked(s_last_ok)) { s_last_ok[0] = '\0'; }
+    /* 显式空库可由 active= 表达；空文件、注释、孤立段名不算数据库。 */
+    return s_count > 0 || (saw_general && saw_active && !s_active[0]);
 }
 
-/* 从 NVS 读文本；成功后 s_text 里有内容 */
+/* 只保护当前真实关联且取得 IP 的网络，不用历史 last_ok 冒充活跃网络。 */
+static bool live_network_locked(db_net_t *live)
+{
+    char ssid[DB_SSID_LEN], pass[DB_PASS_LEN];
+    if (!wifi_mgr_current_credentials(ssid, sizeof(ssid), pass, sizeof(pass))) {
+        return false;
+    }
+    const db_net_t *old = net_find_locked(ssid);
+    memset(live, 0, sizeof(*live));
+    if (old) { *live = *old; }
+    strlcpy(live->ssid, ssid, sizeof(live->ssid));
+    strlcpy(live->wifi_pass, pass, sizeof(live->wifi_pass));
+    return true;
+}
+
+static bool keep_live_locked(const db_net_t *live)
+{
+    if (live->ssid[0]) {
+        db_net_t *net = net_ensure_locked(live->ssid);
+        if (!net) { return false; }
+        *net = *live;  /* 密码、全部账号及当前账号一起保留 */
+        strlcpy(s_active, live->ssid, sizeof(s_active));
+        strlcpy(s_last_ok, live->ssid, sizeof(s_last_ok));
+    }
+    return serialize_locked();
+}
+
 static esp_err_t load_nvs_locked(void)
 {
     size_t len = sizeof(s_text);
     esp_err_t err = nvs_get_blob(s_nvs, NVS_KEY_CFG, s_text, &len);
-    if (err != ESP_OK) {
-        return err;
+    if (err != ESP_OK) { return err; }
+    if (!len || s_text[len - 1] != '\0' || strlen(s_text) + 1 != len) {
+        return ESP_ERR_INVALID_SIZE;
     }
-    s_text[sizeof(s_text) - 1] = '\0';
+    s_nvs_hash = fnv1a(s_text);
+    s_nvs_synced = true;
+    return parse_text_locked(s_text) ? ESP_OK : ESP_ERR_INVALID_ARG;
+}
 
-    uint32_t h = 0;
-    s_sd_hash = (nvs_get_u32(s_nvs, NVS_KEY_HASH, &h) == ESP_OK) ? h : 0;
-
-    parse_text_locked(s_text);
+/* 完整读取并检查 I/O、超长及嵌入零字节，不能接受被截断的前半份配置。 */
+static esp_err_t read_sd_locked(void)
+{
+    if (!s_sd) { return ESP_ERR_INVALID_STATE; }
+    FILE *f = fopen(DB_SD_FILE, "rb");
+    if (!f) { return errno == ENOENT ? ESP_ERR_NOT_FOUND : ESP_FAIL; }
+    unsigned char bom[3];
+    const size_t prefix = fread(bom, 1, sizeof(bom), f);
+    if (prefix != 3 || memcmp(bom, "\xEF\xBB\xBF", 3) != 0) {
+        rewind(f);
+    }
+    const size_t n = fread(s_text, 1, sizeof(s_text) - 1, f);
+    const int extra = fgetc(f);
+    const bool io_ok = !ferror(f);
+    const bool close_ok = fclose(f) == 0;
+    if (!io_ok || !close_ok) { return ESP_FAIL; }
+    s_text[n] = '\0';
+    if (!n || extra != EOF || memchr(s_text, '\0', n)) {
+        return ESP_ERR_INVALID_SIZE;
+    }
     return ESP_OK;
 }
 
-/* 从 SD 读文本到 s_text */
-static esp_err_t read_sd_locked(void)
+/* SD 导入的事务：无效配置不能留下半个库，合并超限也不能丢网络。 */
+static esp_err_t import_sd_locked(const db_net_t *live)
 {
-    if (!s_sd) {
-        return ESP_ERR_INVALID_STATE;
+    snapshot_locked();
+    const uint32_t hash = fnv1a(s_text);
+    if (!parse_text_locked(s_text)) {
+        rollback_locked();
+        return ESP_ERR_INVALID_ARG;
     }
-    FILE *f = fopen(DB_SD_FILE, "rb");
-    if (f == NULL) {
-        return ESP_ERR_NOT_FOUND;
+    if (!keep_live_locked(live)) {
+        rollback_locked();
+        ESP_LOGE(TAG, "SD import rejected: no room for connected network");
+        return ESP_ERR_INVALID_SIZE;
     }
-    const size_t n = fread(s_text, 1, sizeof(s_text) - 1, f);
-    fclose(f);
-    s_text[n] = '\0';
-    return (n > 0) ? ESP_OK : ESP_ERR_INVALID_SIZE;
+    s_sd_hash = hash;
+    s_sd_dirty = hash != fnv1a(s_text);
+    const esp_err_t flash = save_nvs_locked();
+    const esp_err_t sd = s_sd_dirty ? save_sd_locked() : ESP_OK;
+    ESP_LOGI(TAG, "SD authoritative: %d networks, connected network %s", s_count,
+             live->ssid[0] ? "retained" : "absent");
+    return flash != ESP_OK ? flash : sd;
 }
 
-/*
- * 加载优先级（按需求）：SD 卡 > 片上 Flash。
- *
- *   SD 里有文件且能解析出内容  -> 以卡为准，直接覆盖 NVS（用户手改的内容生效）
- *   SD 没卡 / 没文件 / 解析为空 -> 用 NVS
- *   NVS 也没有                -> 编译期默认值播种，并写一份到卡上
- *
- * "能解析出内容" 的判定：至少有一个 [SSID] 段，或者至少有 active=。
- * 这样卡里被写坏了（比如记事本存成乱码）不会被当成有效配置，Flash 的还留着。
- */
+static esp_err_t reload_locked(void)
+{
+    db_net_t live = {0};
+    live_network_locked(&live);
+    snapshot_locked();
+    /* Flash 写失败时，保留待重试的内存数据，不加载较旧的 Flash。 */
+    if (!s_loaded || s_nvs_synced) {
+        if (load_nvs_locked() != ESP_OK) {
+            s_nvs_synced = false;
+            rollback_locked();
+            if (!s_loaded) { seed_defaults_locked(); }
+        }
+    }
+    if (!keep_live_locked(&live)) {
+        rollback_locked();
+        return ESP_ERR_INVALID_SIZE;
+    }
+    s_loaded = true;
+    if (s_sd) {
+        const esp_err_t rd = read_sd_locked();
+        if (rd == ESP_OK) {
+            const esp_err_t err = import_sd_locked(&live);
+            if (err != ESP_ERR_INVALID_ARG) { return err; }
+            ESP_LOGW(TAG, "invalid SD database -> rebuilding from flash");
+        } else if (rd != ESP_ERR_NOT_FOUND && rd != ESP_ERR_INVALID_SIZE) {
+            return rd;
+        }
+    }
+    return save_both_locked();
+}
+
 esp_err_t db_reload(void)
 {
     lock();
-
-    esp_err_t nvs_err = load_nvs_locked();
-    const bool nvs_ok = (nvs_err == ESP_OK) && (s_count > 0 || s_active[0] != '\0');
-
-    char sd_text[DB_TEXT_MAX];
-    bool sd_has_file = false;
-
-    if (s_sd) {
-        FILE *f = fopen(DB_SD_FILE, "rb");
-        if (f != NULL) {
-            const size_t n = fread(sd_text, 1, sizeof(sd_text) - 1, f);
-            fclose(f);
-            sd_text[n] = '\0';
-            sd_has_file = (n > 0);
-        }
-    }
-
-    esp_err_t result = ESP_OK;
-
-    if (sd_has_file) {
-        parse_text_locked(sd_text);
-        const bool sd_valid = (s_count > 0) || (s_active[0] != '\0');
-
-        if (sd_valid) {
-            /* SD 优先：覆盖 Flash。卡本身不重写，保留用户手改的排版。 */
-            result = save_nvs_locked();
-            ESP_LOGI(TAG, "SD is authoritative -> flash overwritten (%d nets)", s_count);
-        } else if (nvs_ok) {
-            /* 卡里内容无效，退回 Flash，不破坏卡上的原文件 */
-            load_nvs_locked();
-            ESP_LOGW(TAG, "SD content unparsable, falling back to flash");
-        } else {
-            seed_defaults_locked();
-            ESP_LOGW(TAG, "SD content unparsable and no flash config, seeded defaults");
-            result = save_nvs_locked();
-        }
-    } else if (nvs_ok) {
-        ESP_LOGI(TAG, "load from flash (sd %s)", s_sd ? "has no file" : "absent");
-        save_sd_locked(); /* 卡在但没文件：补写一份做备份 */
-    } else {
-        seed_defaults_locked();
-        ESP_LOGI(TAG, "seeded defaults (no config anywhere)");
-        result = save_nvs_locked();
-        save_sd_locked();
-    }
-
-    const int count = s_count;
+    const esp_err_t err = reload_locked();
     unlock();
-
-    ESP_LOGI(TAG, "loaded %d network(s), active=[%s], sd=%d", count, s_active, (int)s_sd);
-    return result;
+    return err;
 }
 
 esp_err_t db_restore_from_sd(void)
 {
     lock();
-    const esp_err_t rd = read_sd_locked();
-    if (rd != ESP_OK) {
-        unlock();
-        return rd;
-    }
-    parse_text_locked(s_text);
-    const esp_err_t err = save_nvs_locked();
-    save_sd_locked();
+    db_net_t live = {0};
+    live_network_locked(&live);
+    esp_err_t err = read_sd_locked();
+    if (err == ESP_OK) { err = import_sd_locked(&live); }
     unlock();
-
-    ESP_LOGI(TAG, "restored from SD: %d nets", s_count);
     return err;
+}
+
+static void detach_sd_locked(void)
+{
+    s_sd = false;
+    s_sd_dirty = false;
+    s_sd_hash = 0;
+    /* BSP 卸载会释放 card；立即清空它，禁止对悬空指针再次探测。 */
+    const esp_err_t err = esp_vfs_fat_sdcard_unmount(BSP_SD_MOUNT_POINT, bsp_sdcard);
+    bsp_sdcard = NULL;
+    ESP_LOGW(TAG, "SD unavailable -> flash-only (%s)", esp_err_to_name(err));
+    reload_locked();
+}
+
+/* 没有卡检测 GPIO：每秒发卡状态命令，拔卡后卸载，插卡后重新挂载。
+ * 独立 FreeRTOS 任务，熄屏/80 MHz 省电时照常运行。 */
+static void sd_poll_locked(void)
+{
+    if (s_sd && (!bsp_sdcard || sdmmc_get_status(bsp_sdcard) != ESP_OK)) {
+        detach_sd_locked();
+        return;
+    }
+    if (!s_nvs_synced) { save_nvs_locked(); }
+    if (!s_sd) {
+        if (bsp_sdcard_mount() == ESP_OK) {
+            s_sd = true;
+            s_sd_dirty = false;
+            s_sd_hash = 0;
+            ESP_LOGI(TAG, "SD inserted, reconciling databases");
+            reload_locked();
+            net_guard_trigger();
+        }
+        return;
+    }
+    /* 本次挂载期间写失败的内容先补写，不能导入该卡上的旧版本。 */
+    if (s_sd_dirty) {
+        save_both_locked();
+        return;
+    }
+    const esp_err_t rd = read_sd_locked();
+    if (rd == ESP_FAIL) {
+        detach_sd_locked();
+    } else if (rd != ESP_OK) {
+        save_both_locked();
+    } else if (fnv1a(s_text) != s_sd_hash) {
+        db_net_t live = {0};
+        live_network_locked(&live);
+        const esp_err_t err = import_sd_locked(&live);
+        if (err == ESP_ERR_INVALID_ARG) { save_both_locked(); }
+        if (err == ESP_OK) { net_guard_trigger(); }
+    }
+}
+
+static void sd_task(void *arg)
+{
+    (void)arg;
+    for (;;) {
+        vTaskDelay(pdMS_TO_TICKS(1000));
+        lock();
+        sd_poll_locked();
+        unlock();
+    }
 }
 
 esp_err_t db_init(void)
 {
-    if (s_mtx == NULL) {
+    if (!s_mtx) {
         s_mtx = xSemaphoreCreateMutex();
-        if (s_mtx == NULL) {
-            return ESP_ERR_NO_MEM;
-        }
+        if (!s_mtx) { return ESP_ERR_NO_MEM; }
     }
-
     esp_err_t err = nvs_open(NVS_NS, NVS_READWRITE, &s_nvs);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "nvs_open failed: %s", esp_err_to_name(err));
-        return err;
+    if (err != ESP_OK) { return err; }
+    lock();
+    s_sd = bsp_sdcard_mount() == ESP_OK;
+    err = reload_locked();
+    unlock();
+    if (!s_sd_task && xTaskCreate(sd_task, "db_sd", 6144, NULL, 3, &s_sd_task) != pdPASS) {
+        return ESP_ERR_NO_MEM;
     }
-
-    err = bsp_sdcard_mount();
-    if (err == ESP_OK) {
-        s_sd = true;
-        ESP_LOGI(TAG, "SD mounted at %s", BSP_SD_MOUNT_POINT);
-    } else {
-        s_sd = false;
-        ESP_LOGW(TAG, "no SD card (%s), flash-only mode", esp_err_to_name(err));
-    }
-
-    return db_reload();
+    ESP_LOGI(TAG, "database ready: %d networks, SD=%d; hotplug polling 1 s", s_count, s_sd);
+    return err;
 }
 
 bool db_sd_present(void)
@@ -544,10 +690,12 @@ void db_last_ok(char *out, size_t cap)
 esp_err_t db_set_last_ok(const char *ssid)
 {
     lock();
+    snapshot_locked();
     if (strcmp(s_last_ok, ssid ? ssid : "") != 0) {
         strlcpy(s_last_ok, ssid ? ssid : "", sizeof(s_last_ok));
-        save_nvs_locked();
-        save_sd_locked();
+        const esp_err_t err = commit_edit_locked();
+        unlock();
+        return err;
     }
     unlock();
     return ESP_OK;
@@ -578,7 +726,12 @@ db_net_t *db_ensure_net(const char *ssid, const char *wifi_pass)
     }
 
     lock();
+    snapshot_locked();
     db_net_t *n = net_ensure_locked(ssid);
+    if (!n) {
+        unlock();
+        return NULL;
+    }
     if (n != NULL && wifi_pass != NULL) {
         strlcpy(n->wifi_pass, wifi_pass, sizeof(n->wifi_pass));
     }
@@ -587,20 +740,19 @@ db_net_t *db_ensure_net(const char *ssid, const char *wifi_pass)
     if (s_active[0] == '\0') {
         strlcpy(s_active, ssid, sizeof(s_active));
     }
-    save_nvs_locked();
-    save_sd_locked();
+    const esp_err_t err = n ? commit_edit_locked() : ESP_ERR_NO_MEM;
     unlock();
 
     ESP_LOGI(TAG, "ensure net [%s]", ssid);
-    return n;
+    return err == ESP_OK ? n : NULL;
 }
 
 esp_err_t db_set_active_ssid(const char *ssid)
 {
     lock();
+    snapshot_locked();
     strlcpy(s_active, ssid ? ssid : "", sizeof(s_active));
-    const esp_err_t err = save_nvs_locked();
-    save_sd_locked();
+    const esp_err_t err = commit_edit_locked();
     unlock();
     return err;
 }
@@ -608,17 +760,24 @@ esp_err_t db_set_active_ssid(const char *ssid)
 esp_err_t db_remove_net(const char *ssid)
 {
     lock();
+    snapshot_locked();
+    char live[DB_SSID_LEN], pass[DB_PASS_LEN];
+    if (wifi_mgr_current_credentials(live, sizeof(live), pass, sizeof(pass)) &&
+        strcmp(live, ssid) == 0) {
+        unlock();
+        return ESP_ERR_INVALID_STATE;
+    }
     esp_err_t err = ESP_ERR_NOT_FOUND;
     for (int i = 0; i < s_count; i++) {
         if (strcmp(s_nets[i].ssid, ssid) == 0) {
             memmove(&s_nets[i], &s_nets[i + 1], (size_t)(s_count - i - 1) * sizeof(db_net_t));
             s_count--;
             memset(&s_nets[s_count], 0, sizeof(db_net_t));
+            if (strcmp(s_last_ok, ssid) == 0) { s_last_ok[0] = '\0'; }
             if (strcmp(s_active, ssid) == 0) {
                 s_active[0] = '\0';
             }
-            err = save_nvs_locked();
-            save_sd_locked();
+            err = commit_edit_locked();
             break;
         }
     }
@@ -634,6 +793,7 @@ esp_err_t db_upsert_acct(const char *ssid, const char *user, const char *pass)
     }
 
     lock();
+    snapshot_locked();
     db_net_t *n = net_ensure_locked(ssid);
     if (n == NULL) {
         unlock();
@@ -655,8 +815,7 @@ esp_err_t db_upsert_acct(const char *ssid, const char *user, const char *pass)
     if (n->current[0] == '\0') {
         strlcpy(n->current, user, sizeof(n->current));
     }
-    const esp_err_t err = save_nvs_locked();
-    save_sd_locked();
+    const esp_err_t err = commit_edit_locked();
     unlock();
 
     ESP_LOGI(TAG, "upsert acct [%s] %s -> %s", ssid, user, esp_err_to_name(err));
@@ -666,6 +825,7 @@ esp_err_t db_upsert_acct(const char *ssid, const char *user, const char *pass)
 esp_err_t db_remove_acct(const char *ssid, const char *user)
 {
     lock();
+    snapshot_locked();
     esp_err_t err = ESP_ERR_NOT_FOUND;
     db_net_t *n = net_find_locked(ssid);
     if (n != NULL) {
@@ -678,8 +838,7 @@ esp_err_t db_remove_acct(const char *ssid, const char *user)
             if (strcmp(n->current, user) == 0) {
                 n->current[0] = '\0';
             }
-            err = save_nvs_locked();
-            save_sd_locked();
+            err = commit_edit_locked();
         }
     }
     unlock();
@@ -690,14 +849,14 @@ esp_err_t db_remove_acct(const char *ssid, const char *user)
 esp_err_t db_set_current_acct(const char *ssid, const char *user)
 {
     lock();
+    snapshot_locked();
     db_net_t *n = net_find_locked(ssid);
     if (n == NULL || acct_find_locked(n, user) < 0) {
         unlock();
         return ESP_ERR_NOT_FOUND;
     }
     strlcpy(n->current, user, sizeof(n->current));
-    const esp_err_t err = save_nvs_locked();
-    save_sd_locked();
+    const esp_err_t err = commit_edit_locked();
     unlock();
     return err;
 }
