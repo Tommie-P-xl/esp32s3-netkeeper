@@ -79,6 +79,16 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          # 重跑工作流或重新推送已有标签时，保留已有 Release。
+          tag_path=$(python3 -c 'import os, urllib.parse; print(urllib.parse.quote(os.environ["GITHUB_REF_NAME"], safe=""))')
+          if gh api --include "repos/${GITHUB_REPOSITORY}/releases/tags/${tag_path}" > /tmp/release-response 2> /tmp/release-error; then
+            echo "Release ${GITHUB_REF_NAME} already exists; skipping creation."
+            exit 0
+          elif ! grep -Eq '^HTTP/[0-9.]+ 404([[:space:]]|$)' /tmp/release-response; then
+            cat /tmp/release-error >&2
+            exit 1
+          fi
+
           printf '%s\n' \
             '## 关于固件' \
             '' \
