@@ -16,6 +16,7 @@
 #include "ui.h"
 #include "ui_setup.h"
 #include "wifi_mgr.h"
+#include "http_util.h"
 
 static const char *TAG = "web";
 
@@ -23,31 +24,6 @@ extern const uint8_t index_html_start[] asm("_binary_index_html_start");
 extern const uint8_t index_html_end[] asm("_binary_index_html_end");
 
 /* ------------------------------------------------------------- 小工具 */
-
-static int hexval(char c)
-{
-    if (c >= '0' && c <= '9') return c - '0';
-    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
-    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
-    return -1;
-}
-
-/* 就地百分号解码（'+' 当空格） */
-static void url_decode(char *s)
-{
-    char *o = s;
-    for (char *p = s; *p != '\0'; p++) {
-        if (*p == '+') {
-            *o++ = ' ';
-        } else if (*p == '%' && hexval(p[1]) >= 0 && hexval(p[2]) >= 0) {
-            *o++ = (char)((hexval(p[1]) << 4) | hexval(p[2]));
-            p += 2;
-        } else {
-            *o++ = *p;
-        }
-    }
-    *o = '\0';
-}
 
 static esp_err_t read_body(httpd_req_t *req, char *buf, size_t cap)
 {
@@ -67,29 +43,18 @@ static esp_err_t read_body(httpd_req_t *req, char *buf, size_t cap)
     return ESP_OK;
 }
 
-/* 从 a=b&c=d 里取 a 的值，就地解码 */
+/* 必填字段要求完整解码成功，不能把超长值当作有效前缀。 */
 static bool form_get(char *body, const char *key, char *out, size_t cap)
 {
-    out[0] = '\0';
-    const size_t klen = strlen(key);
-    char *p = body;
+    return http_form_get(body, key, out, cap) == ESP_OK;
+}
 
-    while (p != NULL && *p != '\0') {
-        char *amp = strchr(p, '&');
-        char *pair_end = (amp != NULL) ? amp : p + strlen(p);
-
-        if ((size_t)(pair_end - p) > klen && strncmp(p, key, klen) == 0 && p[klen] == '=') {
-            char *val = p + klen + 1;
-            const size_t save = *pair_end;
-            *pair_end = '\0';
-            strlcpy(out, val, cap);
-            *pair_end = (char)save;
-            url_decode(out);
-            return true;
-        }
-        p = (amp != NULL) ? amp + 1 : NULL;
-    }
-    return false;
+/* 可选字段允许缺失，但格式错误或容量不足必须让整个操作失败。 */
+static bool form_optional(char *body, const char *key, char *out, size_t cap, bool *present)
+{
+    const esp_err_t err = http_form_get(body, key, out, cap);
+    if (present) *present = err == ESP_OK;
+    return err == ESP_OK || err == ESP_ERR_NOT_FOUND;
 }
 
 static esp_err_t reply(httpd_req_t *req, bool ok, const char *msg)
@@ -446,17 +411,20 @@ static bool net_exists(const char *ssid)
 
 static esp_err_t h_wifi(httpd_req_t *req)
 {
-    char body[512];
+    char body[1024];
     if (!authed_body(req, body, sizeof(body))) {
         return ESP_OK;
     }
 
     char ssid[DB_SSID_LEN], pass[DB_PASS_LEN], use[8];
     if (!form_get(body, "ssid", ssid, sizeof(ssid)) || ssid[0] == '\0') {
-        return reply(req, false, "缺少 ssid");
+        return reply(req, false, "WiFi 名称缺失、格式错误或过长");
     }
-    const bool has_pass = form_get(body, "pass", pass, sizeof(pass));
-    form_get(body, "use", use, sizeof(use));
+    bool has_pass = false;
+    if (!form_optional(body, "pass", pass, sizeof(pass), &has_pass) ||
+        !form_optional(body, "use", use, sizeof(use), NULL)) {
+        return reply(req, false, "参数格式错误或过长");
+    }
 
     const bool exists = net_exists(ssid);
     const bool want_use = (use[0] == '1');
@@ -488,20 +456,22 @@ static esp_err_t h_wifi(httpd_req_t *req)
 
 static esp_err_t h_acct(httpd_req_t *req)
 {
-    char body[512];
+    char body[1024];
     if (!authed_body(req, body, sizeof(body))) {
         return ESP_OK;
     }
 
     char ssid[DB_SSID_LEN], user[DB_USER_LEN], pass[DB_PASS_LEN], use[8];
     if (!form_get(body, "ssid", ssid, sizeof(ssid)) || ssid[0] == '\0') {
-        return reply(req, false, "缺少 ssid");
+        return reply(req, false, "WiFi 名称缺失、格式错误或过长");
     }
     if (!form_get(body, "user", user, sizeof(user)) || user[0] == '\0') {
-        return reply(req, false, "缺少 user");
+        return reply(req, false, "账号缺失、格式错误或过长");
     }
-    form_get(body, "pass", pass, sizeof(pass));
-    form_get(body, "use", use, sizeof(use));
+    if (!form_optional(body, "pass", pass, sizeof(pass), NULL) ||
+        !form_optional(body, "use", use, sizeof(use), NULL)) {
+        return reply(req, false, "参数格式错误或过长");
+    }
 
     esp_err_t err = db_upsert_acct(ssid, user, pass);
     if (err != ESP_OK) {
@@ -519,7 +489,7 @@ static esp_err_t h_acct(httpd_req_t *req)
 
 static esp_err_t h_use(httpd_req_t *req)
 {
-    char body[384];
+    char body[512];
     if (!authed_body(req, body, sizeof(body))) {
         return ESP_OK;
     }
@@ -527,7 +497,7 @@ static esp_err_t h_use(httpd_req_t *req)
     char ssid[DB_SSID_LEN], user[DB_USER_LEN];
     if (!form_get(body, "ssid", ssid, sizeof(ssid)) ||
         !form_get(body, "user", user, sizeof(user))) {
-        return reply(req, false, "参数不全");
+        return reply(req, false, "参数缺失、格式错误或过长");
     }
 
     if (db_set_current_acct(ssid, user) != ESP_OK) {
@@ -540,15 +510,17 @@ static esp_err_t h_use(httpd_req_t *req)
 
 static esp_err_t h_remove(httpd_req_t *req)
 {
-    char body[384];
+    char body[512];
     if (!authed_body(req, body, sizeof(body))) {
         return ESP_OK;
     }
 
     char type[8], ssid[DB_SSID_LEN], user[DB_USER_LEN];
-    form_get(body, "type", type, sizeof(type));
+    if (!form_get(body, "type", type, sizeof(type))) {
+        return reply(req, false, "参数缺失、格式错误或过长");
+    }
     if (!form_get(body, "ssid", ssid, sizeof(ssid))) {
-        return reply(req, false, "缺少 ssid");
+        return reply(req, false, "WiFi 名称缺失、格式错误或过长");
     }
 
     esp_err_t err;
@@ -556,7 +528,7 @@ static esp_err_t h_remove(httpd_req_t *req)
         err = db_remove_net(ssid);
     } else {
         if (!form_get(body, "user", user, sizeof(user))) {
-            return reply(req, false, "缺少 user");
+            return reply(req, false, "账号缺失、格式错误或过长");
         }
         err = db_remove_acct(ssid, user);
     }

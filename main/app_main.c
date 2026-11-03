@@ -2,8 +2,9 @@
  * 校园网守护 —— ESP32-S3 + AMOLED 屏 + SD 卡配置库。
  *
  * 启动顺序（顺序有讲究）：
- *   nvs -> netif -> 事件循环           WiFi 的前提
- *   db_init()                          挂载 SD、读配置；没卡就只在内存里跑
+ *   nvs -> 电池开机检查                 低电时不进入后续初始化
+ *   netif -> 事件循环                   WiFi 的前提
+ *   db_init()                          挂载 SD、读配置；没卡则保存在 Flash
  *   显示 -> UI                         先把界面点起来，用户能立刻看到状态
  *   wifi_mgr -> net_guard -> web       网络、守护、网页面板
  *
@@ -64,6 +65,13 @@ void app_main(void)
     }
     ESP_ERROR_CHECK(err);
 
+    /* 先检查电池，拒绝低压开机时不初始化屏幕、SD 或 WiFi。 */
+    err = batt_mgr_init();
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "battery protection init failed: %s", esp_err_to_name(err));
+        return;
+    }
+
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
     sys_time_init();   /* 东八区；校时等拿到 IP 后再做 */
@@ -86,13 +94,11 @@ void app_main(void)
         ui_unlock();
 
         power_mgr_start();
-
-        /* 电池状态：借用 BSP 已经建好的 I2C 总线读 AXP2101。
-         * 失败（板子没 PMIC / 总线异常）不影响主流程，界面自己会把电池行藏掉。 */
-        batt_mgr_start();
     } else {
         ESP_LOGE(TAG, "display init failed, UI disabled");
     }
+
+    ESP_ERROR_CHECK(batt_mgr_start());
 
     wifi_mgr_init();
     net_guard_start();

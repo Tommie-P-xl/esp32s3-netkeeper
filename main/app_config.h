@@ -63,6 +63,16 @@
 /* 充电时 VBAT 被抬高（线损 + 极化），查表前先减掉，否则电量会虚高 */
 #define APP_BAT_CHG_OFFSET_MV     40
 
+/* 单节 3.7 V / 1000 mAh、充电限制 4.2 V 的电池。 */
+#define APP_BAT_CHARGE_CURRENT_MA 300
+#define APP_BAT_TERM_CURRENT_MA   50
+/* 软件关机需连续三次低压；关机锁定跨重启保留，恢复电压留出回差。 */
+#define APP_BAT_OFF_MV            3300
+#define APP_BAT_RESUME_MV         3500
+#define APP_BAT_LOW_SAMPLES       3
+/* PMU 的 VSYS 欠压兜底，区别于上面的电池端软件阈值。 */
+#define APP_BAT_HARD_OFF_MV       3000
+
 /* --------------------------------------------------------------- 调试 */
 /* 启动时把 SRun 加密算法自检打一遍（bring-up 用，已验证过，默认关） */
 #define APP_CRYPTO_SELFTEST       0

@@ -84,13 +84,13 @@ esp_err_t http_get_capture(const char *url, int timeout_ms, http_resp_t *out)
     return ESP_OK;
 }
 
-void http_url_encode(const char *in, char *out, size_t cap)
+bool http_url_encode(const char *in, char *out, size_t cap)
 {
     static const char hex[] = "0123456789ABCDEF";
     size_t o = 0;
 
     if (cap == 0) {
-        return;
+        return false;
     }
 
     for (const unsigned char *p = (const unsigned char *)in; *p != '\0'; p++) {
@@ -101,12 +101,14 @@ void http_url_encode(const char *in, char *out, size_t cap)
 
         if (safe) {
             if (o + 1 >= cap) {
-                break;
+                out[0] = '\0';
+                return false;
             }
             out[o++] = (char)c;
         } else {
             if (o + 3 >= cap) {
-                break;
+                out[0] = '\0';
+                return false;
             }
             out[o++] = '%';
             out[o++] = hex[c >> 4];
@@ -114,4 +116,68 @@ void http_url_encode(const char *in, char *out, size_t cap)
         }
     }
     out[o] = '\0';
+    return true;
+}
+
+static int hex_value(char c)
+{
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+}
+
+esp_err_t http_form_get(const char *body, const char *key, char *out, size_t cap)
+{
+    if (!body || !key || !out || cap == 0) return ESP_ERR_INVALID_ARG;
+    out[0] = '\0';
+    const size_t klen = strlen(key);
+    for (const char *p = body; *p;) {
+        const char *end = strchr(p, '&');
+        if (!end) end = p + strlen(p);
+        if ((size_t)(end - p) > klen && !strncmp(p, key, klen) && p[klen] == '=') {
+            size_t n = 0;
+            for (p += klen + 1; p < end; ++p) {
+                unsigned char c = (unsigned char)*p;
+                if (c == '+') c = ' ';
+                else if (c == '%') {
+                    if (end - p < 3 || hex_value(p[1]) < 0 || hex_value(p[2]) < 0) {
+                        out[0] = '\0';
+                        return ESP_ERR_INVALID_ARG;
+                    }
+                    c = (unsigned char)((hex_value(p[1]) << 4) | hex_value(p[2]));
+                    p += 2;
+                }
+                if (!c || n + 1 >= cap) {
+                    out[0] = '\0';
+                    return c ? ESP_ERR_INVALID_SIZE : ESP_ERR_INVALID_ARG;
+                }
+                out[n++] = (char)c;
+            }
+            out[n] = '\0';
+            return ESP_OK;
+        }
+        p = *end ? end + 1 : end;
+    }
+    return ESP_ERR_NOT_FOUND;
+}
+
+bool http_json_escape(const char *in, char *out, size_t cap)
+{
+    static const char hex[] = "0123456789abcdef";
+    if (!cap) return false;
+    size_t n = 0;
+    for (const unsigned char *p = (const unsigned char *)in; *p; ++p) {
+        const size_t need = *p < 0x20 ? 6 : ((*p == '"' || *p == '\\') ? 2 : 1);
+        if (n + need >= cap) { out[0] = '\0'; return false; }
+        if (*p < 0x20) {
+            out[n++] = '\\'; out[n++] = 'u'; out[n++] = '0'; out[n++] = '0';
+            out[n++] = hex[*p >> 4]; out[n++] = hex[*p & 15];
+        } else {
+            if (need == 2) out[n++] = '\\';
+            out[n++] = (char)*p;
+        }
+    }
+    out[n] = '\0';
+    return true;
 }

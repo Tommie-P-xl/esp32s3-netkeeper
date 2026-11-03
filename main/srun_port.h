@@ -38,6 +38,12 @@ typedef enum {
  */
 probe_result_t srun_probe(portal_info_t *pi);
 
+/** @brief 查询 Portal 实际在线账号；未在线返回 ESP_ERR_NOT_FOUND。 */
+esp_err_t srun_online_user(const portal_info_t *pi, char *user, size_t cap);
+
+/** @brief 注销实际在线账号，供同一 WiFi 上切换认证账号使用。 */
+bool srun_logout(const portal_info_t *pi, const char *user, char *detail, size_t cap);
+
 typedef enum {
     LOGIN_OK = 0,   /* 认证成功 */
     LOGIN_ALREADY,  /* 服务端说该 IP 已在线，等价于成功 */

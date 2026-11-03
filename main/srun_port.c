@@ -9,8 +9,47 @@
 #include "esp_timer.h"
 #include "http_util.h"
 #include "srun_crypto.h"
+#include "nvs.h"
+#include "wifi_mgr.h"
 
 static const char *TAG = "srun";
+
+/* 只缓存发现过的 Portal 和对应 WiFi，不保存认证密码。在线重启后仍能注销旧账号。 */
+static void portal_defaults(portal_info_t *pi)
+{
+    strlcpy(pi->portal_base, APP_PORTAL_FALLBACK_HOST, sizeof(pi->portal_base));
+    strlcpy(pi->ac_id, APP_PORTAL_FALLBACK_ACID, sizeof(pi->ac_id));
+    nvs_handle_t h;
+    if (nvs_open("srun", NVS_READONLY, &h) != ESP_OK) return;
+    char ssid[33] = "", saved[33] = "", host[64] = "", acid[8] = "";
+    wifi_mgr_ssid(ssid, sizeof(ssid));
+    size_t ns = sizeof(saved), nh = sizeof(host), na = sizeof(acid);
+    if (nvs_get_str(h, "ssid", saved, &ns) == ESP_OK && !strcmp(ssid, saved) &&
+        nvs_get_str(h, "host", host, &nh) == ESP_OK &&
+        nvs_get_str(h, "acid", acid, &na) == ESP_OK && host[0] && acid[0]) {
+        strlcpy(pi->portal_base, host, sizeof(pi->portal_base));
+        strlcpy(pi->ac_id, acid, sizeof(pi->ac_id));
+    }
+    nvs_close(h);
+}
+
+static void portal_remember(const portal_info_t *pi)
+{
+    if (!strcmp(pi->portal_base, "http://0.0.0.0")) return;
+    portal_info_t old = {0};
+    portal_defaults(&old);
+    if (!strcmp(old.portal_base, pi->portal_base) && !strcmp(old.ac_id, pi->ac_id)) return;
+    nvs_handle_t h;
+    if (nvs_open("srun", NVS_READWRITE, &h) != ESP_OK) return;
+    char ssid[33] = "";
+    wifi_mgr_ssid(ssid, sizeof(ssid));
+    esp_err_t err = nvs_set_str(h, "ssid", ssid);
+    if (err == ESP_OK) err = nvs_set_str(h, "host", pi->portal_base);
+    if (err == ESP_OK) err = nvs_set_str(h, "acid", pi->ac_id);
+    if (err == ESP_OK) err = nvs_commit(h);
+    if (err != ESP_OK) ESP_LOGW(TAG, "Portal cache write failed: %s", esp_err_to_name(err));
+    nvs_close(h);
+}
 
 /* -------------------------------------------------------------- helpers */
 
@@ -89,8 +128,7 @@ static bool json_get(const char *json, const char *key, char *out, size_t cap)
 /* 从 Location 里抠出 http://host 与 ac_id */
 static void parse_location(const char *loc, portal_info_t *pi)
 {
-    strlcpy(pi->portal_base, APP_PORTAL_FALLBACK_HOST, sizeof(pi->portal_base));
-    strlcpy(pi->ac_id, APP_PORTAL_FALLBACK_ACID, sizeof(pi->ac_id));
+    portal_defaults(pi);
 
     if (loc == NULL || loc[0] == '\0') {
         return;
@@ -122,194 +160,187 @@ static void parse_location(const char *loc, portal_info_t *pi)
 
 /* ---------------------------------------------------------------- probe */
 
+static probe_result_t probe_response(const http_resp_t *r, portal_info_t *pi)
+{
+    if (r->status == 204) {
+        strlcpy(pi->detail, "已联网", sizeof(pi->detail));
+        return PROBE_ONLINE;
+    }
+    if ((r->status >= 300 && r->status < 400) || r->status == 200) {
+        parse_location(r->location, pi);
+        snprintf(pi->detail, sizeof(pi->detail), "需要校园网认证（HTTP %d）", r->status);
+        portal_remember(pi);
+        return PROBE_NEED_AUTH;
+    }
+    return PROBE_NO_LINK;
+}
+
 probe_result_t srun_probe(portal_info_t *pi)
 {
-    http_resp_t *r = calloc(1, sizeof(http_resp_t));
-    if (r == NULL) {
+    /* 包括分配失败路径，调用方也始终拿到已初始化的状态。 */
+    memset(pi, 0, sizeof(*pi));
+    portal_defaults(pi);
+    http_resp_t *r = calloc(1, sizeof(*r));
+    if (!r) {
+        strlcpy(pi->detail, "探测内存不足", sizeof(pi->detail));
         return PROBE_NO_LINK;
     }
-
-    memset(pi, 0, sizeof(*pi));
-    strlcpy(pi->portal_base, APP_PORTAL_FALLBACK_HOST, sizeof(pi->portal_base));
-    strlcpy(pi->ac_id, APP_PORTAL_FALLBACK_ACID, sizeof(pi->ac_id));
-
     probe_result_t res = PROBE_NO_LINK;
-
-    /* 第一跳：主探测地址 */
-    esp_err_t err = http_get_capture(APP_PROBE_URL_PRIMARY, APP_HTTP_TIMEOUT_MS, r);
-    if (err == ESP_OK) {
-        ESP_LOGI(TAG, "probe %s -> HTTP %d loc=[%s]",
-                 APP_PROBE_URL_PRIMARY, r->status, r->location);
-
-        if (r->status == 204) {
-            strlcpy(pi->detail, "已联网", sizeof(pi->detail));
-            res = PROBE_ONLINE;
-        } else if (r->status >= 300 && r->status < 400) {
-            parse_location(r->location, pi);
-            snprintf(pi->detail, sizeof(pi->detail), "被劫持 -> %s", pi->portal_base);
-            res = PROBE_NEED_AUTH;
-        } else if (r->status == 200) {
-            /* 有些 Portal 直接 200 返回登录页，URL 不变 */
-            parse_location(r->location, pi);
-            strlcpy(pi->detail, "返回登录页（200）", sizeof(pi->detail));
-            res = PROBE_NEED_AUTH;
-        }
-    } else {
-        ESP_LOGW(TAG, "probe primary failed: %s", esp_err_to_name(err));
-
-        /* 第二跳：换个 204 地址，排除单个域名的问题 */
-        err = http_get_capture(APP_PROBE_URL_SECONDARY, APP_HTTP_TIMEOUT_MS, r);
-        if (err == ESP_OK && r->status == 204) {
-            strlcpy(pi->detail, "已联网", sizeof(pi->detail));
-            res = PROBE_ONLINE;
-            goto done;
-        }
-
-        /* 第三跳：直接摸兜底 Portal，能通说明只是 DNS 挂了 */
-        char url[128];
-        snprintf(url, sizeof(url), "%s/srun_portal_pc?ac_id=%s&theme=pro",
-                 APP_PORTAL_FALLBACK_HOST, APP_PORTAL_FALLBACK_ACID);
-        err = http_get_capture(url, APP_HTTP_TIMEOUT_MS, r);
-        if (err == ESP_OK && r->status > 0) {
-            snprintf(pi->detail, sizeof(pi->detail), "兜底 Portal 可达（HTTP %d）", r->status);
-            res = PROBE_NEED_AUTH;
-        } else {
-            strlcpy(pi->detail, "探不到 Portal", sizeof(pi->detail));
-            res = PROBE_NO_LINK;
+    const char *urls[] = {APP_PROBE_URL_PRIMARY, APP_PROBE_URL_SECONDARY};
+    for (size_t i = 0; i < sizeof(urls) / sizeof(urls[0]); ++i) {
+        const esp_err_t err = http_get_capture(urls[i], APP_HTTP_TIMEOUT_MS, r);
+        if (err == ESP_OK) {
+            res = probe_response(r, pi);
+            if (res != PROBE_NO_LINK) goto done;
+            ESP_LOGW(TAG, "probe HTTP %d, trying next endpoint", r->status);
         }
     }
-
+    char url[160];
+    snprintf(url, sizeof(url), "%s/srun_portal_pc?ac_id=%s&theme=pro", pi->portal_base, pi->ac_id);
+    if (http_get_capture(url, APP_HTTP_TIMEOUT_MS, r) == ESP_OK &&
+        (r->status == 200 || (r->status >= 300 && r->status < 400))) {
+        strlcpy(pi->detail, "兜底 Portal 可达", sizeof(pi->detail));
+        res = PROBE_NEED_AUTH;
+    } else {
+        strlcpy(pi->detail, "外网与 Portal 均不可达", sizeof(pi->detail));
+    }
 done:
     free(r);
     return res;
 }
 
-/* ---------------------------------------------------------------- login */
+/* 查询服务端实际在线账号，避免把界面选中的账号当成已经登录的账号。 */
+esp_err_t srun_online_user(const portal_info_t *pi, char *user, size_t cap)
+{
+    user[0] = '\0';
+    if (!strcmp(pi->portal_base, "http://0.0.0.0")) return ESP_ERR_INVALID_STATE;
+    http_resp_t *r = calloc(1, sizeof(*r));
+    if (!r) return ESP_ERR_NO_MEM;
+    char url[192];
+    snprintf(url, sizeof(url), "%s/cgi-bin/rad_user_info?callback=jsonp&_=%lld",
+             pi->portal_base, (long long)(esp_timer_get_time() / 1000));
+    esp_err_t err = http_get_capture(url, APP_HTTP_TIMEOUT_MS, r);
+    if (err == ESP_OK) {
+        err = ESP_FAIL;
+        if (r->status == 200) {
+            char *js = strip_jsonp(r->body);
+            if (js && (json_get(js, "user_name", user, cap) || json_get(js, "username", user, cap)) && user[0]) {
+                err = ESP_OK;
+            } else if (!js && strchr(r->body, ',')) {
+                const size_t n = (size_t)(strchr(r->body, ',') - r->body);
+                if (n && n < cap && r->body[0] != '<') {
+                    memcpy(user, r->body, n); user[n] = '\0'; err = ESP_OK;
+                }
+            } else if (strstr(r->body, "not_online")) {
+                err = ESP_ERR_NOT_FOUND;
+            }
+        }
+    }
+    free(r);
+    return err;
+}
+
+/* 注销前用 challenge 取得服务端看到的 IP，兼容设备在 NAT 后的情况。 */
+bool srun_logout(const portal_info_t *pi, const char *user, char *detail, size_t cap)
+{
+    http_resp_t *r = calloc(1, sizeof(*r));
+    if (!r) { strlcpy(detail, "内存不足", cap); return false; }
+    char encoded[192], url[512], ip[20] = "";
+    bool ok = false;
+    if (!http_url_encode(user, encoded, sizeof(encoded))) goto done;
+    snprintf(url, sizeof(url), "%s/cgi-bin/get_challenge?callback=jsonp&username=%s&ip=&_=%lld",
+             pi->portal_base, encoded, (long long)(esp_timer_get_time() / 1000));
+    if (http_get_capture(url, APP_HTTP_TIMEOUT_MS, r) != ESP_OK) goto done;
+    char *js = strip_jsonp(r->body);
+    if (!js || !json_get(js, "client_ip", ip, sizeof(ip)) || !ip[0]) goto done;
+    /* client_ip 必须是地址，不能把任意响应文本拼入查询串。 */
+    char ip_enc[60];
+    if (!http_url_encode(ip, ip_enc, sizeof(ip_enc))) goto done;
+    snprintf(url, sizeof(url), "%s/cgi-bin/srun_portal?callback=jsonp&action=logout&username=%s&ac_id=%s&ip=%s&_=%lld",
+             pi->portal_base, encoded, pi->ac_id, ip_enc, (long long)(esp_timer_get_time() / 1000));
+    if (http_get_capture(url, APP_HTTP_TIMEOUT_MS, r) != ESP_OK) goto done;
+    js = strip_jsonp(r->body);
+    char error[32] = "", msg[80] = "";
+    if (js) {
+        json_get(js, "error", error, sizeof(error));
+        json_get(js, "suc_msg", msg, sizeof(msg));
+        ok = r->status == 200 && (!strcmp(error, "ok") || !strcmp(msg, "logout_ok") ||
+                                  !strcmp(error, "not_online_error"));
+    }
+done:
+    strlcpy(detail, ok ? "旧账号已退出" : "退出旧账号失败，未切换认证账号", cap);
+    free(r);
+    return ok;
+}
+
+/* 编码后的字段可显著变长，工作区放堆上，避免增加守护任务栈的压力。 */
+typedef struct {
+    http_resp_t response;
+    char username[64], user_enc[192], user_json[384], pass_json[384];
+    char url[5120], json[1024], info[1400], info_enc[4200], checksum_input[2400];
+    char hmd5[33], chksum[41], ip[20], token[80];
+} login_workspace_t;
 
 login_result_t srun_login(const portal_info_t *pi, const char *user, const char *pass,
-                          const char *domain, char *detail, size_t detail_cap)
+                         const char *domain, char *detail, size_t detail_cap)
 {
-    char username[64];
-    char url[1024];
-    char hmd5[33];
-    char info[640];
-    char info_enc[900];
-    char chksum[41];
-    char json[384];
-    char ip[20] = "";
-    char token[80] = "";
-
-    http_resp_t *r = calloc(1, sizeof(http_resp_t));
-    if (r == NULL) {
-        strlcpy(detail, "内存不足", detail_cap);
-        return LOGIN_FAIL;
+    login_workspace_t *w = calloc(1, sizeof(*w));
+    if (!w) { strlcpy(detail, "内存不足", detail_cap); return LOGIN_FAIL; }
+    login_result_t result = LOGIN_FAIL;
+    strlcpy(detail, "认证参数过长或格式错误", detail_cap);
+    int n = snprintf(w->username, sizeof(w->username), "%s%s", user, domain ? domain : "");
+    if (n < 0 || (size_t)n >= sizeof(w->username) ||
+        !http_url_encode(w->username, w->user_enc, sizeof(w->user_enc)) ||
+        !http_json_escape(w->username, w->user_json, sizeof(w->user_json)) ||
+        !http_json_escape(pass, w->pass_json, sizeof(w->pass_json))) goto done;
+    n = snprintf(w->url, sizeof(w->url), "%s/cgi-bin/get_challenge?callback=jsonp&username=%s&ip=&_=%lld",
+                 pi->portal_base, w->user_enc, (long long)(esp_timer_get_time() / 1000));
+    if (n < 0 || (size_t)n >= sizeof(w->url)) goto done;
+    esp_err_t err = http_get_capture(w->url, APP_HTTP_TIMEOUT_MS, &w->response);
+    if (err != ESP_OK) { snprintf(detail, detail_cap, "取 challenge 失败: %s", esp_err_to_name(err)); goto done; }
+    char *js = strip_jsonp(w->response.body);
+    if (!js || w->response.status != 200) { strlcpy(detail, "challenge 响应异常", detail_cap); goto done; }
+    json_get(js, "challenge", w->token, sizeof(w->token));
+    json_get(js, "client_ip", w->ip, sizeof(w->ip));
+    if (!w->token[0] || !w->ip[0] || strspn(w->ip, "0123456789.:") != strlen(w->ip)) {
+        strlcpy(detail, "challenge 或客户端 IP 无效", detail_cap); goto done;
     }
-
-    snprintf(username, sizeof(username), "%s%s", user, domain ? domain : "");
-
-    /* --- 1. 取 challenge（同时从服务端视角拿 client_ip，NAT 后面也对） --- */
-    snprintf(url, sizeof(url), "%s/cgi-bin/get_challenge?callback=jsonp&username=%s&ip=&_=%lld",
-             pi->portal_base, username, (long long)(esp_timer_get_time() / 1000));
-
-    esp_err_t err = http_get_capture(url, APP_HTTP_TIMEOUT_MS, r);
-    if (err != ESP_OK) {
-        snprintf(detail, detail_cap, "取 challenge 失败: %s", esp_err_to_name(err));
-        goto fail;
+    srun_hmac_md5_hex(w->token, pass, w->hmd5);
+    n = snprintf(w->json, sizeof(w->json),
+                 "{\"username\":\"%s\",\"password\":\"%s\",\"ip\":\"%s\",\"acid\":\"%s\",\"enc_ver\":\"srun_bx1\"}",
+                 w->user_json, w->pass_json, w->ip, pi->ac_id);
+    if (n < 0 || (size_t)n >= sizeof(w->json)) goto done;
+    srun_encode_info(w->json, w->token, w->info, sizeof(w->info));
+    if (!w->info[0]) { strlcpy(detail, "info 生成失败", detail_cap); goto done; }
+    n = snprintf(w->checksum_input, sizeof(w->checksum_input), "%s%s%s%s%s%s%s%s%s%s%s%s%s%s",
+                 w->token, w->username, w->token, w->hmd5, w->token, pi->ac_id,
+                 w->token, w->ip, w->token, "200", w->token, "1", w->token, w->info);
+    if (n < 0 || (size_t)n >= sizeof(w->checksum_input)) goto done;
+    srun_sha1_hex(w->checksum_input, strlen(w->checksum_input), w->chksum);
+    if (!http_url_encode(w->info, w->info_enc, sizeof(w->info_enc))) goto done;
+    n = snprintf(w->url, sizeof(w->url),
+                 "%s/cgi-bin/srun_portal?callback=jsonp&action=login&username=%s"
+                 "&password=%%7BMD5%%7D%s&os=Windows+NT&name=Windows&double_stack=0"
+                 "&chksum=%s&info=%s&ac_id=%s&ip=%s&n=200&type=1&_=%lld",
+                 pi->portal_base, w->user_enc, w->hmd5, w->chksum, w->info_enc, pi->ac_id, w->ip,
+                 (long long)(esp_timer_get_time() / 1000));
+    if (n < 0 || (size_t)n >= sizeof(w->url)) goto done;
+    err = http_get_capture(w->url, APP_HTTP_TIMEOUT_MS + 4000, &w->response);
+    if (err != ESP_OK) { snprintf(detail, detail_cap, "登录请求失败: %s", esp_err_to_name(err)); goto done; }
+    js = strip_jsonp(w->response.body);
+    if (!js || w->response.status != 200) { strlcpy(detail, "登录响应异常", detail_cap); goto done; }
+    char error[24] = "", suc[48] = "", message[80] = "";
+    json_get(js, "error", error, sizeof(error));
+    json_get(js, "suc_msg", suc, sizeof(suc));
+    json_get(js, "error_msg", message, sizeof(message));
+    if (!strcmp(error, "ok")) {
+        result = !strcmp(suc, "ip_already_online_error") ? LOGIN_ALREADY : LOGIN_OK;
+        strlcpy(detail, result == LOGIN_ALREADY ? "该 IP 已在线" : "登录成功", detail_cap);
+        portal_remember(pi);
+    } else {
+        snprintf(detail, detail_cap, "%s %s", error, message);
     }
-
-    {
-        char *js = strip_jsonp(r->body);
-        if (js == NULL) {
-            snprintf(detail, detail_cap, "challenge 响应异常: %.60s", r->body);
-            goto fail;
-        }
-        json_get(js, "challenge", token, sizeof(token));
-        json_get(js, "client_ip", ip, sizeof(ip));
-    }
-
-    if (token[0] == '\0') {
-        snprintf(detail, detail_cap, "challenge 为空，Portal 可能换了接口");
-        goto fail;
-    }
-    ESP_LOGI(TAG, "challenge=%s client_ip=%s", token, ip);
-
-    /* --- 2. hmd5 --- */
-    srun_hmac_md5_hex(token, pass, hmd5);
-
-    /* --- 3. info --- */
-    snprintf(json, sizeof(json),
-             "{\"username\":\"%s\",\"password\":\"%s\",\"ip\":\"%s\","
-             "\"acid\":\"%s\",\"enc_ver\":\"srun_bx1\"}",
-             username, pass, ip, pi->ac_id);
-    srun_encode_info(json, token, info, sizeof(info));
-    if (info[0] == '\0') {
-        snprintf(detail, detail_cap, "info 生成失败");
-        goto fail;
-    }
-
-    /* --- 4. chksum --- */
-    {
-        char buf[1024];
-        snprintf(buf, sizeof(buf), "%s%s%s%s%s%s%s%s%s%s%s%s%s%s",
-                 token, username,
-                 token, hmd5,
-                 token, pi->ac_id,
-                 token, ip,
-                 token, "200",
-                 token, "1",
-                 token, info);
-        srun_sha1_hex(buf, strlen(buf), chksum);
-    }
-
-    /* --- 5. 发起登录 --- */
-    http_url_encode(info, info_enc, sizeof(info_enc));
-    snprintf(url, sizeof(url),
-             "%s/cgi-bin/srun_portal?callback=jsonp&action=login&username=%s"
-             "&password=%%7BMD5%%7D%s&os=Windows+NT&name=Windows&double_stack=0"
-             "&chksum=%s&info=%s&ac_id=%s&ip=%s&n=200&type=1&_=%lld",
-             pi->portal_base, username, hmd5, chksum, info_enc, pi->ac_id, ip,
-             (long long)(esp_timer_get_time() / 1000));
-
-    err = http_get_capture(url, APP_HTTP_TIMEOUT_MS + 4000, r);
-    if (err != ESP_OK) {
-        snprintf(detail, detail_cap, "登录请求失败: %s", esp_err_to_name(err));
-        goto fail;
-    }
-
-    {
-        char *js = strip_jsonp(r->body);
-        if (js == NULL) {
-            snprintf(detail, detail_cap, "登录响应异常(HTTP %d): %.60s", r->status, r->body);
-            goto fail;
-        }
-
-        char err_code[24] = "";
-        char suc[48] = "";
-        char emsg[80] = "";
-        json_get(js, "error", err_code, sizeof(err_code));
-        json_get(js, "suc_msg", suc, sizeof(suc));
-        json_get(js, "error_msg", emsg, sizeof(emsg));
-
-        ESP_LOGI(TAG, "login resp: error=%s suc_msg=%s error_msg=%s", err_code, suc, emsg);
-
-        login_result_t lr;
-        if (strcmp(err_code, "ok") == 0) {
-            if (strcmp(suc, "ip_already_online_error") == 0) {
-                snprintf(detail, detail_cap, "该 IP 已在线");
-                lr = LOGIN_ALREADY;
-            } else {
-                snprintf(detail, detail_cap, "登录成功 %s", suc);
-                lr = LOGIN_OK;
-            }
-        } else {
-            snprintf(detail, detail_cap, "%s %s", err_code, emsg);
-            lr = LOGIN_FAIL;
-        }
-        free(r);
-        return lr;
-    }
-
-fail:
-    free(r);
-    return LOGIN_FAIL;
+done:
+    free(w);
+    return result;
 }

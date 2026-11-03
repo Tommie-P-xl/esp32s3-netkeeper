@@ -8,6 +8,7 @@
 #pragma once
 
 #include <stddef.h>
+#include <stdbool.h>
 
 #include "esp_err.h"
 
@@ -37,7 +38,13 @@ esp_err_t http_get_capture(const char *url, int timeout_ms, http_resp_t *out);
 /**
  * @brief 把字符串做百分号编码（用于把 info/chksum 塞进查询串）。
  */
-void http_url_encode(const char *in, char *out, size_t cap);
+bool http_url_encode(const char *in, char *out, size_t cap);
+
+/* 解码后检查容量；缺失返回 NOT_FOUND，非法编码和超长均拒绝，不返回截断值。 */
+esp_err_t http_form_get(const char *body, const char *key, char *out, size_t cap);
+
+/* JSON 字符串内容转义（不含外层引号），容量不足返回 false。 */
+bool http_json_escape(const char *in, char *out, size_t cap);
 
 #ifdef __cplusplus
 }

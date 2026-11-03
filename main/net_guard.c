@@ -93,7 +93,7 @@ static bool idle_wait(uint32_t wait_ms)
 
 /* ------------------------------------------------------------ 检测一次 */
 
-static bool run_cycle(const char *ssid, const char *user, const char *pass)
+static bool run_cycle(const char *ssid, const char *user, const char *pass, bool switching)
 {
     portal_info_t pi;
     char detail[96];
@@ -108,8 +108,24 @@ static bool run_cycle(const char *ssid, const char *user, const char *pass)
     portEXIT_CRITICAL(&s_lock);
 
     if (pr == PROBE_ONLINE) {
-        state_set(NET_ONLINE, "%s", pi.detail);
-        return true;
+        char actual[64] = "", wanted[64];
+        snprintf(wanted, sizeof(wanted), "%s%s", user, APP_PORTAL_DOMAIN);
+        const esp_err_t query = srun_online_user(&pi, actual, sizeof(actual));
+        if (query == ESP_OK && strcmp(actual, wanted) != 0) {
+            switching = true;
+            state_set(NET_AUTHING, "正在切换认证账号");
+            if (!srun_logout(&pi, actual, detail, sizeof(detail))) {
+                state_set(NET_AUTH_FAILED, "%s", detail);
+                return false;
+            }
+            /* 已退出旧会话，本轮必须登录新账号，不能再次走“外网已通”捷径。 */
+        } else if (query == ESP_OK || (!switching && query != ESP_ERR_NOT_FOUND)) {
+            state_set(NET_ONLINE, query == ESP_OK ? "已联网，认证账号已核实" : "已联网（认证账号未核验）");
+            return true;
+        } else if (query != ESP_ERR_NOT_FOUND) {
+            state_set(NET_AUTH_FAILED, "无法查询原认证账号，请检查 Portal 地址");
+            return false;
+        }
     }
 
     if (pr == PROBE_NO_LINK) {
@@ -154,6 +170,15 @@ static bool run_cycle(const char *ssid, const char *user, const char *pass)
     /* 认证返回成功不等于真有网：再探一次才算数 */
     probe_result_t pr2 = srun_probe(&pi);
     if (pr2 == PROBE_ONLINE) {
+        /* “IP 已在线”也可能仍属于旧账号，切换场景必须核实身份。 */
+        if (switching || lr == LOGIN_ALREADY) {
+            char actual[64] = "", wanted[64];
+            snprintf(wanted, sizeof(wanted), "%s%s", user, APP_PORTAL_DOMAIN);
+            if (srun_online_user(&pi, actual, sizeof(actual)) != ESP_OK || strcmp(actual, wanted)) {
+                state_set(NET_AUTH_FAILED, "外网已通，但新认证账号尚未确认");
+                return false;
+            }
+        }
         portENTER_CRITICAL(&s_lock);
         s_st.auth_count++;
         portEXIT_CRITICAL(&s_lock);
@@ -196,6 +221,7 @@ static void net_task(void *arg)
 {
     (void)arg;
     int conn_fail = 0;
+    char applied_ssid[DB_SSID_LEN] = "", applied_user[DB_USER_LEN] = "";
 
     for (;;) {
         char target[33] = "";
@@ -308,7 +334,12 @@ static void net_task(void *arg)
         portEXIT_CRITICAL(&s_lock);
 
         /* --- 检测 + 必要时认证 --- */
-        const bool online = run_cycle(target, user, acct_pass);
+        const bool switching = !strcmp(applied_ssid, target) && applied_user[0] && strcmp(applied_user, user);
+        const bool online = run_cycle(target, user, acct_pass, switching);
+        if (online) {
+            strlcpy(applied_ssid, target, sizeof(applied_ssid));
+            strlcpy(applied_user, user, sizeof(applied_user));
+        }
 
         portENTER_CRITICAL(&s_lock);
         s_st.fail_streak = online ? 0 : (s_st.fail_streak + 1);
