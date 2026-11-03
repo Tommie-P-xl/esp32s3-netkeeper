@@ -2,6 +2,7 @@ idf_component_register(
     SRCS
         app_main.c
         power_mgr.c
+        display_port.c
         db.c
         wifi_mgr.c
         net_guard.c

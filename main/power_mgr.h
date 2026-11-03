@@ -36,8 +36,7 @@ extern "C" {
 /**
  * @brief Start the display.
  *
- * Thin wrapper over bsp_display_start(); kept so the application has a single
- * entry point for display + idle handling.
+ * Set up the BSP display and reusable DMA transfer buffer before networking.
  */
 lv_display_t *power_mgr_display_start(void);
 

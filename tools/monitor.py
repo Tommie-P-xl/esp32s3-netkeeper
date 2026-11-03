@@ -28,7 +28,14 @@ for arg in sys.argv[1:]:
         except ValueError:
             pass
 
-ser = serial.Serial(PORT, 115200, timeout=0.02)
+# Configure control lines before opening the USB CDC port. pySerial defaults
+# both to True; even --no-reset then changes them on open/close and can cause
+# an ESP32-S3 USB-UART reset when the monitor exits.
+ser = serial.Serial(port=None, baudrate=115200, timeout=0.02)
+ser.dtr = False
+ser.rts = False
+ser.port = PORT
+ser.open()
 ser.set_buffer_size(rx_size=1024 * 1024)
 
 if RESET:

@@ -86,9 +86,8 @@ void app_main(void)
 
     lv_display_t *disp = power_mgr_display_start();
     if (disp != NULL) {
-        bsp_display_backlight_on();
-
         ui_lock(-1);
+        bsp_display_backlight_on();
         ui_create(disp);
         lv_timer_create(boot_hint, 2500, NULL);
         ui_unlock();

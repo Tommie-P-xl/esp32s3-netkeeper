@@ -332,13 +332,16 @@ main/
   web.{c,h}         局域网配置面板 + JSON API + 验证码鉴权
   sys_time.{c,h}    SNTP 校时 + 系统时间
   batt_mgr.{c,h}    电池：AXP2101 读电压/充放电状态，按功耗模型估续航
+  power_mgr.{c,h}   熄屏、触摸唤醒与 CPU 降频，统一屏幕亮度访问
+  display_port.{c,h} BSP 显示初始化 + 可复用的内部 DMA 传输缓冲
   ui.c              主界面
   ui_setup.c        选网 / 输密码 / 账号管理
   ui_common.{c,h}   配色、字体、按钮工厂、顶部时钟
   ui_font_18.c      生成的中文字体（勿手改）
   index.html        配置页（构建时嵌进固件）
 tools/
-  monitor.py        复位 + 抓串口日志（CDC 无流控，直接 drain）
+  monitor.py        抓串口日志；默认复位，--no-reset 保持设备运行
+  test_logic.py     主机回归：编译真实 C 逻辑，覆盖输入、认证、电池、电源和显示传输
   fb2png.py         把固件打到串口的 FBDUMP 显存转回 PNG
   mask_dump.py      给截图做像素化打码（写 README 用）
   collect_symbols.py 扫描源码里的所有非 ASCII 字，生成 symbols.txt
@@ -436,6 +439,10 @@ AXP2101 没有电池电流 ADC，所以这是模型估算而不是实测——`A
 
 默认策略是「熄屏 + CPU 降频到 80 MHz」，约 25–30 mA，好处是串口一直可用。
 
+亮屏、熄屏命令与 LVGL 绘图共用显示锁，避免两个任务并发访问同一个屏幕 SPI 设备。
+切页期间显示锁繁忙时会保留唤醒请求并重试；命令成功后才更新屏幕状态。
+屏幕传输缓冲在网络启动前一次性分配并复用，避免 WiFi 扫描时临时 DMA 内存不足导致部分画面未能刷新。
+
 真要跑电池、也不在乎串口的话，把 `main/power_mgr.c` 里的
 `POWER_MGR_LIGHT_SLEEP` 改成 1，会进入 light sleep（约 1–2 mA），
 靠触摸 INT 唤醒；代价是 USB-Serial/JTAG 控制台会消失。
@@ -524,7 +531,7 @@ flowchart LR
 同步手段按"临界区有多长"来选，这是刻意区分的：
 
 - **显示锁** `ui_lock(ms)` / `ui_unlock()`：包 `esp_lv_adapter_lock()`，递归互斥，
-  可以拿很久，只用于 LVGL 控件操作。
+  可以拿很久，用于 LVGL 控件操作和同一屏幕 SPI 设备上的亮度命令。
 - **配置锁**：`db.c` 内部一把 mutex，对外暴露 `db_read_begin()` / `db_read_end()`
   让你成段读（期间别调会改库的函数，会自锁）。
 - **状态快照**：`net_guard` 用 `portENTER_CRITICAL`，因为拷的是 300 字节的普通结构体，
@@ -540,7 +547,7 @@ esp_netif_init()          协议栈
 esp_event_loop_create()   事件循环，WiFi 事件要投递到这里
 sys_time_init()           设东八区（校时等拿到 IP 再说）
 db_init()                 挂 SD、加载配置，启动 SD 热插拔与同步后台任务
-power_mgr_display_start() QSPI 初始化 + LVGL 起来，返回 lv_display_t*
+power_mgr_display_start() QSPI + LVGL 初始化，预留 DMA 传输缓冲，返回 lv_display_t*
 ui_create()               ★ 建主界面，用户此刻开始看到东西
 boot_hint (2.5 s 后)      没配网就直接把"选 WiFi"页推上去；没插卡弹提示
 power_mgr_start()         熄屏/降频看门狗
@@ -832,6 +839,17 @@ bool ui_lock(int timeout_ms) {
 - **顶部时钟**：挂在 `ui_header()` 里，所以每个子界面自动都有；主界面单独居中。
   内容来自 `sys_time`，每 500 ms 刷一次（和状态刷新同一个 `lv_timer`）。
 
+**切页割裂与残影的排查结论**：从主页进入 WiFi 页时，曾出现短暂卡顿和新旧画面交错，
+扫描结束后仍留有部分旧内容。复现时抓到 `Failed to allocate priv TX buffer` 和
+`Draw bitmap failed: ESP_ERR_NO_MEM`：BSP 的绘图缓冲位于 PSRAM，SPI 每次传输还需临时申请
+内部 DMA 缓冲；内部连续内存不足时，该显示块未能发送，后续局部刷新也不会补齐整页。
+重启只能暂时缓解，不能消除这条失败路径。
+
+`display_port.c` 现按 LVGL 绘图缓冲的实际大小，在 WiFi 启动前一次性预留内部 DMA 内存并复用。
+适配层完成像素打包及 RGB565 字节交换后，将数据复制到这块内存再发送；沿用原有完成回调，
+上一块传输完成后才复用缓冲。无需改动页面布局，也不更改 BSP 的触摸配置。
+修正后记录了 18 轮扫描，原有 DMA 分配与传输失败未再出现，实机反复切页也已确认画面正常。
+
 ### 11. 电源管理（`power_mgr.c`）
 
 三级策略，都靠"最后一次触摸时间"驱动：
@@ -859,6 +877,11 @@ stateDiagram-v2
 
 也就是说：INT 只当作"可能有触摸"的廉价门控，真正认定触摸要问 LVGL。
 改之前用的是纯电平，实测出现过"充电时一直亮着"——根因就是 INT 卡低。
+
+亮度命令也会访问屏幕 SPI，必须与 LVGL 绘图共用显示锁。此前实机出现过屏幕停住、
+不自动熄灭，但网页仍可访问，任务栈显示电源任务和绘图任务同时卡在 SPI 访问中。
+现在启动亮屏及运行期亮度设置都在显示锁内执行；锁繁忙时保留唤醒请求并重试，
+命令成功后才更新屏幕状态，避免切页期间漏掉唯一一次触摸边沿。
 
 > [!NOTE]
 > 插着 USB 充电时，熄屏（10 s）和降频（70 s）**照样执行**，和电池供电一致；
@@ -978,6 +1001,8 @@ stateDiagram-v2
 
 | 症状 | 根因 | 修法 |
 |---|---|---|
+| 主页切入 WiFi 页割裂、卡顿，扫描后仍有旧画面 | PSRAM 绘图数据传输时临时申请内部 DMA 缓冲失败，出现 `ESP_ERR_NO_MEM`，部分显示块未发送 | `display_port.c` 在网络启动前预留并复用内部 DMA 缓冲；等传输完成后再复用。[§10](#10-ui一条线程一把锁一套排版规则uic--ui_commonc--ui_setupc) |
+| 屏幕停住且不自动熄灭，网页仍可访问 | 电源任务与 LVGL 绘图并发访问同一屏幕 SPI 设备 | 所有亮度命令与绘图共用显示锁；拿锁失败不提前改变屏幕状态，保留唤醒请求重试。[§11](#11-电源管理power_mgrc) |
 | 画面冻住、点屏没反应，但 HTTP 正常、`uptime` 在涨 | `bsp_display_lock()` 把 `esp_err_t` 直接转 `bool`，而 `ESP_OK==0`——拿到锁反而判成失败，临界区被跳过、锁泄漏 | 全项目只用 `ui_lock()`（`== ESP_OK` 判定），禁用 BSP 那个函数的返回值。[§10](#10-ui一条线程一把锁一套排版规则uic--ui_commonc--ui_setupc) |
 | 汉字变方框（tofu） | 混排行用了 `lv_font_montserrat_14`，它既没有 `·` 也没有汉字 | 混排一律 `ui_font_18`，并用 `font_coverage.py` 校验覆盖率。[§10](#10-ui一条线程一把锁一套排版规则uic--ui_commonc--ui_setupc) |
 | 「网 / 认 / 证 / 检 / 测」大面积缺字 | LVGL 自带 `SOURCE_HAN_SANS_SC_16_CJK` 其实是偏日文的子集 | 按源码用字生成子集字体（`collect_symbols.py` → `node gen.js`）。[§10](#10-ui一条线程一把锁一套排版规则uic--ui_commonc--ui_setupc) |
@@ -1010,6 +1035,7 @@ stateDiagram-v2
 
 | 症状 | 根因 | 修法 |
 |---|---|---|
+| 仅采集串口日志，采集结束后却突然重启 | 实机读到 `ESP_RST_USB`；pySerial 默认 DTR/RTS 状态会使端口开关改变控制信号，仅跳过重启序列仍不够 | `monitor.py` 在打开端口前将 DTR/RTS 设为关闭；保持设备运行时使用 `--no-reset`。修正后连续开关串口三次，运行时间和界面计数均持续增长 |
 | 烧完就挂，串口只有 `ets_loader.c 78` 然后反复复位 | 用了 `qio` 烧录，ROM 按 QIO 启动后在第一段加载后挂死 | `flash.ps1` 写死 `--flash-mode dio`。 |
 | 烧完屏幕全黑、串口一个字都没有、网页也打不开 | 这块板 **EN 没接 USB 的 RTS**，`--after hard-reset` 是空操作，芯片停在 ROM 下载模式 | 写入用 `no-reset`，成功后再单独发 `watchdog-reset`；仍不行长按 PWR 冷启动。 |
 | 抓图那几分钟时钟、倒计时全冻住，熄屏也推迟 | 整屏 hex 直接在 `lv_timer` 回调里写串口，一屏 90 秒，LVGL 任务被占死 | 快照留在 LVGL 线程（几十毫秒），hex 发送交给独立 `fbdump` 任务。 |

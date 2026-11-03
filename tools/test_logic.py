@@ -226,11 +226,144 @@ int main(void){
 }
 '''
 
+# Compile the actual power transitions and supervisor loop with controlled time,
+# touch and display-lock stubs, so retries exercise the firmware's real code.
+power = (ROOT / "main/power_mgr.c").read_text(encoding="utf-8")
+(OUT / "power-under-test.c").write_text(
+    '#include "app_config.h"\ntypedef unsigned TickType_t;\n' +
+    power[power.index("#define POWER_MGR_LIGHT_SLEEP"):power.index("/* ---------------------------------------------------------------- cpu freq */")] +
+    power[power.index("static void power_task("):power.index("/* -------------------------------------------------------------------- init */")],
+    encoding="utf-8")
+
+POWER_TEST = r'''
+#include "common.h"
+static int lock_calls, lock_failures, writes, cpu_mhz, steps, limit, gpio_calls;
+static unsigned now;
+static bool locked, driver_fails, touch_edge;
+static jmp_buf finish;
+static void test_delay(unsigned ticks);
+#undef vTaskDelay
+#define vTaskDelay(ticks) test_delay(ticks)
+#define BSP_LCD_TOUCH_INT 11
+#define portTICK_PERIOD_MS 1
+static int gpio_get_level(int pin);
+static unsigned xTaskGetTickCount(void);
+static bool any_indev_pressed(void);
+static void enter_low_power(void);
+bool ui_lock(int timeout_ms);
+void ui_unlock(void);
+esp_err_t bsp_display_brightness_set(int brightness);
+#include "power-under-test.c"
+static void set_cpu_mhz(int mhz){cpu_mhz=mhz;}
+static int gpio_get_level(int pin){return touch_edge && gpio_calls++ ? 0 : 1;}
+static unsigned xTaskGetTickCount(void){return now;}
+static bool any_indev_pressed(void){return false;}
+static void enter_low_power(void){s_low_power=true;}
+static void test_delay(unsigned ticks){now+=ticks;if(++steps>=limit)longjmp(finish,1);}
+bool ui_lock(int timeout_ms){
+ assert(timeout_ms==50);++lock_calls;
+ if(lock_calls<=lock_failures)return false;
+ assert(!locked);locked=true;return true;
+}
+void ui_unlock(void){assert(locked);locked=false;}
+esp_err_t bsp_display_brightness_set(int brightness){
+ assert(locked);++writes;return driver_fails?ESP_FAIL:ESP_OK;
+}
+static void reset(void){
+ lock_calls=lock_failures=writes=cpu_mhz=steps=gpio_calls=0;
+ locked=driver_fails=touch_edge=false;limit=1;now=11000;
+ s_screen_on=true;s_low_power=false;s_last_activity=0;
+}
+int main(void){
+ reset();lock_failures=1;
+ if(!setjmp(finish))power_task(NULL);
+ assert(s_screen_on && !writes && !locked);
+ reset();driver_fails=true;
+ if(!setjmp(finish))power_task(NULL);
+ assert(s_screen_on && writes==1 && !locked);
+ reset();
+ if(!setjmp(finish))power_task(NULL);
+ assert(!s_screen_on && writes==1 && !locked);
+ reset();s_screen_on=false;s_low_power=true;driver_fails=true;
+ assert(!panel_on() && !s_screen_on && s_low_power && !cpu_mhz && !locked);
+ /* One touch edge, two busy-lock failures, then success without another edge. */
+ reset();s_screen_on=false;s_low_power=true;touch_edge=true;
+ now=1000;limit=3;lock_failures=2;
+ if(!setjmp(finish))power_task(NULL);
+ assert(lock_calls==3 && writes==1 && s_screen_on && !s_low_power);
+ assert(cpu_mhz==240 && s_last_activity==1020 && !locked);
+ puts("PASS display serialization, failed blank/wake state, retained touch wake and retries");
+}
+'''
+
+DISPLAY_TEST = r'''
+#include "common.h"
+#define ESP_ERROR_CHECK(e) assert((e)==ESP_OK)
+#define MALLOC_CAP_INTERNAL 1
+#define MALLOC_CAP_DMA 2
+typedef void *esp_lcd_panel_handle_t;
+typedef struct {
+ esp_err_t (*custom_draw_bitmap)(lv_display_t *,esp_lcd_panel_handle_t,
+                                 int,int,int,int,const void *,void *);
+} esp_lv_adapter_draw_bitmap_callbacks_t;
+static esp_lv_adapter_draw_bitmap_callbacks_t registered;
+static uint8_t dma[48008];
+static int allocations, transfers, lock_depth;
+static bool no_memory, no_display, pending, fail_transfer;
+lv_display_t *bsp_display_start(void){return no_display?NULL:(void *)1;}
+uint32_t lv_display_get_draw_buf_size(lv_display_t *d){return 48000;}
+void *heap_caps_malloc(size_t n,unsigned caps){
+ assert(n==48000 && caps==(MALLOC_CAP_INTERNAL|MALLOC_CAP_DMA));
+ ++allocations;return no_memory?NULL:dma;
+}
+esp_err_t esp_lv_adapter_lock(int ms){assert(ms==-1 && !lock_depth);++lock_depth;return ESP_OK;}
+void esp_lv_adapter_unlock(void){assert(lock_depth==1);--lock_depth;}
+esp_err_t esp_lv_adapter_set_draw_bitmap_callbacks(lv_display_t *d,
+ const esp_lv_adapter_draw_bitmap_callbacks_t *c,void *ctx){
+ assert(lock_depth==1);registered=*c;return ESP_OK;
+}
+esp_err_t esp_lcd_panel_draw_bitmap(esp_lcd_panel_handle_t p,
+ int x1,int y1,int x2,int y2,const void *pixels){
+ assert(!pending && pixels==dma);++transfers;
+ if(fail_transfer)return ESP_FAIL;
+ pending=true;return ESP_OK;
+}
+#include "display_port.c"
+int main(void){
+ no_display=true;assert(!display_port_start() && !allocations);
+ no_display=false;no_memory=true;
+ assert(!display_port_start() && allocations==1 && !lock_depth);
+ assert(!registered.custom_draw_bitmap);
+ no_memory=false;allocations=0;
+ assert(display_port_start() && allocations==1 && !lock_depth);
+ uint8_t pixels[48000];memset(dma,0xcc,sizeof(dma));
+ for(int i=0;i<100;i++){
+   const int rows=i%2?50:2;
+   memset(pixels,i,sizeof(pixels));
+   assert(registered.custom_draw_bitmap((void *)1,(void *)2,0,0,480,rows,pixels,NULL)==ESP_OK);
+   assert(!memcmp(dma,pixels,480*rows*2));
+   memset(pixels,0xff,sizeof(pixels));
+   assert(dma[0]==i && dma[480*rows*2-1]==i);
+   pending=false; /* Normal adapter done ISR unblocks LVGL's next flush. */
+ }
+ assert(allocations==1 && transfers==100 && dma[48000]==0xcc);
+ assert(draw_bitmap((void *)1,(void *)2,0,0,480,52,pixels,NULL)==ESP_ERR_INVALID_SIZE);
+ assert(draw_bitmap((void *)1,(void *)2,0,0,0,2,pixels,NULL)==ESP_ERR_INVALID_ARG);
+ assert(transfers==100 && dma[48000]==0xcc);
+ fail_transfer=true;
+ assert(draw_bitmap((void *)1,(void *)2,0,0,480,2,pixels,NULL)==ESP_FAIL && !pending);
+ puts("PASS reusable DMA buffer, packed pixel copy, allocation/start failures, size checks and transfer error");
+}
+'''
+for name in ("esp_heap_caps.h", "esp_lv_adapter.h", "esp_lv_adapter_display.h"):
+    (OUT / name).write_text('#include "common.h"\n', encoding="utf-8")
+
 gcc = shutil.which("gcc")
 if not gcc:
     raise SystemExit("gcc is required for host C regression tests")
 for name, code, helpers in (("http", HTTP_TEST, True), ("battery", BATTERY_TEST, False),
-                            ("srun", SRUN_TEST, True), ("guard", GUARD_TEST, False)):
+                            ("srun", SRUN_TEST, True), ("guard", GUARD_TEST, False),
+                            ("power", POWER_TEST, False), ("display", DISPLAY_TEST, False)):
     src = OUT / f"{name}_test.c"
     src.write_text(code, encoding="utf-8")
     exe = OUT / (name + (".exe" if __import__("os").name == "nt" else ""))

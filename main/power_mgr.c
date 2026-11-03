@@ -14,6 +14,7 @@
 #include "bsp/display.h"
 #include "ui_common.h"   /* ui_lock / ui_unlock：查 LVGL 的触摸状态要用显示锁 */
 #include "app_config.h"
+#include "display_port.h"
 
 static const char *TAG = "power_mgr";
 
@@ -49,22 +50,44 @@ static void set_cpu_mhz(int mhz);
 
 /* ------------------------------------------------------------------ panel */
 
-static void panel_off(void)
+/* 与 LVGL 绘图使用同一把锁：亮度命令也会访问同一个 SPI panel IO。
+ * 没拿到锁就交给下一轮重试，不能在命令尚未执行时修改屏幕状态。 */
+static bool panel_set_brightness(int brightness)
 {
-    s_screen_on = false;
-    bsp_display_brightness_set(0);
-    ESP_LOGI(TAG, "no touch for %d s, panel off", IDLE_TO_BLANK_MS / 1000);
+    if (!ui_lock(50)) {
+        return false;
+    }
+    esp_err_t err = bsp_display_brightness_set(brightness);
+    ui_unlock();
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "panel brightness failed: %s", esp_err_to_name(err));
+        return false;
+    }
+    return true;
 }
 
-static void panel_on(void)
+static bool panel_off(void)
 {
+    if (!panel_set_brightness(0)) {
+        return false;
+    }
+    s_screen_on = false;
+    ESP_LOGI(TAG, "no touch for %d s, panel off", IDLE_TO_BLANK_MS / 1000);
+    return true;
+}
+
+static bool panel_on(void)
+{
+    if (!panel_set_brightness(s_brightness)) {
+        return false;
+    }
     if (s_low_power) {
         s_low_power = false;
         set_cpu_mhz(ACTIVE_CPU_MHZ);
     }
-    bsp_display_brightness_set(s_brightness);
     s_screen_on = true;
     ESP_LOGI(TAG, "panel on");
+    return true;
 }
 
 /* ---------------------------------------------------------------- cpu freq */
@@ -111,7 +134,9 @@ static void enter_low_power(void)
     esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_TIMER);
     esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_GPIO);
 
-    panel_on();
+    while (!panel_on()) {
+        vTaskDelay(pdMS_TO_TICKS(POLL_MS));
+    }
     s_last_activity = xTaskGetTickCount();
 #else
     ESP_LOGI(TAG, "no touch for %d s, idle: cpu %d MHz, panel off",
@@ -157,6 +182,7 @@ static void power_task(void *arg)
      * 边沿只在真的按下那一刻出现，卡低时没有边沿，也就不会反复唤醒。 */
     bool int_prev_low = (gpio_get_level(BSP_LCD_TOUCH_INT) == 0);
     TickType_t blank_tick = 0;
+    bool wake_pending = false;
 
 #if APP_IDLE_DEBUG
     uint32_t dbg_low = 0, dbg_press = 0;
@@ -178,7 +204,11 @@ static void power_task(void *arg)
             }
         } else if (falling && (now - blank_tick) >= pdMS_TO_TICKS(300)) {
             /* 熄屏后留 300 ms 死区：刚熄灭时手还在屏上，避免刚黑就亮 */
-            panel_on();
+            wake_pending = true;
+        }
+        /* 切页时显示锁可能暂时繁忙，保留唤醒请求，不能丢掉唯一一次触摸边沿。 */
+        if (wake_pending && panel_on()) {
+            wake_pending = false;
             s_last_activity = now;
         }
 
@@ -186,8 +216,9 @@ static void power_task(void *arg)
 
         if (s_screen_on) {
             if (idle_ms >= IDLE_TO_BLANK_MS) {
-                panel_off();
-                blank_tick = now;
+                if (panel_off()) {
+                    blank_tick = now;
+                }
             }
         } else if (!s_low_power && idle_ms >= IDLE_TO_BLANK_MS + BLANK_TO_IDLE_MS) {
             enter_low_power();
@@ -218,7 +249,7 @@ static void power_task(void *arg)
 
 lv_display_t *power_mgr_display_start(void)
 {
-    return bsp_display_start();
+    return display_port_start();
 }
 
 esp_err_t power_mgr_start(void)
