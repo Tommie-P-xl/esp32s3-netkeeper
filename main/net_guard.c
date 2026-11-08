@@ -25,6 +25,7 @@ static const int32_t s_backoff_ms[] = APP_RETRY_BACKOFF_MS;
 
 static char s_last_target[33];
 static char s_try_ssid[33]; /* 待试连的目标，见 net_guard_try_ssid() */
+static char s_switch_ssid[33], s_switch_user[40];
 
 static int64_t now_ms(void)
 {
@@ -85,6 +86,15 @@ void net_guard_trigger(void)
     }
 }
 
+void net_guard_switch_account(const char *ssid, const char *user)
+{
+    portENTER_CRITICAL(&s_lock);
+    strlcpy(s_switch_ssid, ssid, sizeof(s_switch_ssid));
+    strlcpy(s_switch_user, user, sizeof(s_switch_user));
+    portEXIT_CRITICAL(&s_lock);
+    net_guard_trigger();
+}
+
 void net_guard_try_ssid(const char *ssid)
 {
     if (ssid == NULL || ssid[0] == '\0') {
@@ -132,17 +142,23 @@ static bool run_cycle(const char *ssid, const char *user, const char *pass, bool
         char actual[64] = "", wanted[64];
         snprintf(wanted, sizeof(wanted), "%s%s", user, APP_PORTAL_DOMAIN);
         const esp_err_t query = srun_online_user(&pi, actual, sizeof(actual));
-        if (query == ESP_OK && strcmp(actual, wanted) != 0) {
-            switching = true;
+        if (!switching || (query == ESP_OK && !strcmp(actual, wanted))) {
+            if (query == ESP_OK) {
+                portENTER_CRITICAL(&s_lock);
+                strlcpy(s_st.account, actual, sizeof(s_st.account));
+                portEXIT_CRITICAL(&s_lock);
+            }
+            state_set(NET_ONLINE, query != ESP_OK ? "已联网（认证账号未核验）" :
+                      strcmp(actual, wanted) ? "已联网，保留现有认证会话" : "已联网，认证账号已核实");
+            return true;
+        }
+        if (query == ESP_OK) {
             state_set(NET_AUTHING, "正在切换认证账号");
             if (!srun_logout(&pi, actual, detail, sizeof(detail))) {
                 state_set(NET_AUTH_FAILED, "%s", detail);
                 return false;
             }
             /* 已退出旧会话，本轮必须登录新账号，不能再次走“外网已通”捷径。 */
-        } else if (query == ESP_OK || (!switching && query != ESP_ERR_NOT_FOUND)) {
-            state_set(NET_ONLINE, query == ESP_OK ? "已联网，认证账号已核实" : "已联网（认证账号未核验）");
-            return true;
         } else if (query != ESP_ERR_NOT_FOUND) {
             state_set(NET_AUTH_FAILED, "无法查询原认证账号，请检查 Portal 地址");
             return false;
@@ -355,7 +371,12 @@ static void net_task(void *arg)
         portEXIT_CRITICAL(&s_lock);
 
         /* --- 检测 + 必要时认证 --- */
-        const bool switching = !strcmp(applied_ssid, target) && applied_user[0] && strcmp(applied_user, user);
+        portENTER_CRITICAL(&s_lock);
+        const bool requested_switch = !strcmp(s_switch_ssid, target) && !strcmp(s_switch_user, user);
+        s_switch_ssid[0] = s_switch_user[0] = '\0';
+        portEXIT_CRITICAL(&s_lock);
+        const bool switching = requested_switch ||
+            (!strcmp(applied_ssid, target) && applied_user[0] && strcmp(applied_user, user));
         const bool online = run_cycle(target, user, acct_pass, switching);
         if (online) {
             strlcpy(applied_ssid, target, sizeof(applied_ssid));
@@ -404,6 +425,7 @@ void net_guard_start(void)
     strlcpy(s_st.detail, "启动中", sizeof(s_st.detail));
     s_st.boot_ms = now_ms();
     s_last_target[0] = '\0';
+    s_switch_ssid[0] = s_switch_user[0] = '\0';
 
     s_trigger = xSemaphoreCreateBinary();
     if (s_trigger == NULL) {

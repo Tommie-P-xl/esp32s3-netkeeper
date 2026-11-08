@@ -59,6 +59,9 @@ void net_guard_get(net_status_t *out);
 /** @brief 立刻做一次检测，不等周期。 */
 void net_guard_trigger(void);
 
+/** @brief 用户明确选择使用账号时调用；普通检测和开机不注销现有会话。 */
+void net_guard_switch_account(const char *ssid, const char *user);
+
 /**
  * @brief 试连一个 WiFi，连上了才把它设为守护目标。
  *

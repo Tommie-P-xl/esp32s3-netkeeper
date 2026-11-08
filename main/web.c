@@ -480,9 +480,11 @@ static esp_err_t h_acct(httpd_req_t *req)
     if (use[0] == '1') {
         db_set_current_acct(ssid, user);
         db_set_active_ssid(ssid);
+        net_guard_switch_account(ssid, user);
+    } else {
+        net_guard_trigger();
     }
 
-    net_guard_trigger();
     ESP_LOGI(TAG, "acct %s@%s saved", user, ssid);
     return reply(req, true, "ok");
 }
@@ -504,7 +506,7 @@ static esp_err_t h_use(httpd_req_t *req)
         return reply(req, false, "没有这个账号");
     }
     db_set_active_ssid(ssid);
-    net_guard_trigger();
+    net_guard_switch_account(ssid, user);
     return reply(req, true, "ok");
 }
 

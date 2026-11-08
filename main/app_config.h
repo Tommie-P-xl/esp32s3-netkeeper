@@ -20,9 +20,10 @@
 /* 学号后面要不要带域后缀。多数校园网登录页默认为空，失败可试 "@cmcc" */
 #define APP_PORTAL_DOMAIN      ""
 
-/* 自动探测失败（抓不到 302 跳转）时的兜底 Portal */
-#define APP_PORTAL_FALLBACK_HOST  "http://0.0.0.0"
-#define APP_PORTAL_FALLBACK_ACID  "1"
+/* 当前学校的专用兜底配置；其他学校使用前必须修改，见 README。
+ * 只填协议、主机及可选端口，不含成功页路径和查询参数。 */
+#define APP_PORTAL_FALLBACK_HOST  "http://10.253.0.235"
+#define APP_PORTAL_FALLBACK_ACID  "3"
 
 /* ---------------------------------------------------------------- 轮询 */
 #define APP_POLL_INTERVAL_MS   (5 * 60 * 1000)

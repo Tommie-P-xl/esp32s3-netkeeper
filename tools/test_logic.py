@@ -76,7 +76,7 @@ i2c_master_bus_handle_t bsp_i2c_get_handle(void);
 void esp_sleep_disable_wakeup_source(int);
 void esp_deep_sleep_start(void);
 '''
-for name in ("esp_err.h", "esp_log.h", "esp_timer.h", "nvs.h", "esp_wifi.h", "esp_event.h", "esp_netif.h",
+for name in ("esp_err.h", "esp_log.h", "esp_timer.h", "nvs.h", "esp_wifi.h", "esp_event.h", "esp_netif.h", "esp_http_client.h",
              "lvgl.h", "esp_sleep.h", "driver/i2c_master.h", "bsp/esp-bsp.h",
              "freertos/FreeRTOS.h", "freertos/task.h", "freertos/semphr.h", "freertos/event_groups.h"):
     p = OUT / name
@@ -161,13 +161,30 @@ int main(void){
 
 SRUN_TEST = r'''
 #include "common.h"
+#include "app_config.h"
+static char fallback_host[64]=APP_PORTAL_FALLBACK_HOST;
+#undef APP_PORTAL_FALLBACK_HOST
+#define APP_PORTAL_FALLBACK_HOST fallback_host
 #include "srun_port.c"
-static int primary_status=503,secondary_status=204,calls;
+static int primary_status=503,secondary_status=204,calls,queries,challenges,logins;
+enum {INFO_OFFLINE,INFO_ONLINE,INFO_HTML,INFO_FAIL};
+static int info_mode;
+static bool cached;
+static char cached_host[64],cached_acid[8],cached_ssid[33];
+static char primary_location[192],secondary_location[192];
+static char blocked_host[64];
 static char last_json[1024], last_login[5120];
-esp_err_t nvs_open(const char *s,int m,nvs_handle_t *h){return ESP_ERR_NOT_FOUND;}
-esp_err_t nvs_get_str(nvs_handle_t h,const char*k,char*v,size_t*n){return ESP_ERR_NOT_FOUND;}
-esp_err_t nvs_set_str(nvs_handle_t h,const char*k,const char*v){return 0;}
-esp_err_t nvs_commit(nvs_handle_t h){return 0;}
+esp_err_t nvs_open(const char *s,int m,nvs_handle_t *h){if(m==NVS_READONLY && !cached)return ESP_ERR_NOT_FOUND;*h=1;return ESP_OK;}
+esp_err_t nvs_get_str(nvs_handle_t h,const char*k,char*v,size_t*n){
+ const char *value=!strcmp(k,"host")?cached_host:!strcmp(k,"acid")?cached_acid:cached_ssid;
+ if(strlen(value)+1>*n)return ESP_ERR_INVALID_SIZE;strlcpy(v,value,*n);return ESP_OK;
+}
+esp_err_t nvs_set_str(nvs_handle_t h,const char*k,const char*v){
+ if(!strcmp(k,"host"))strlcpy(cached_host,v,sizeof(cached_host));
+ else if(!strcmp(k,"acid"))strlcpy(cached_acid,v,sizeof(cached_acid));
+ else strlcpy(cached_ssid,v,sizeof(cached_ssid));return ESP_OK;
+}
+esp_err_t nvs_commit(nvs_handle_t h){cached=true;return ESP_OK;}
 void nvs_close(nvs_handle_t h){}
 void wifi_mgr_ssid(char *s,size_t n){strlcpy(s,"test",n);}
 void srun_hmac_md5_hex(const char*k,const char*m,char*out){memset(out,'a',32);out[32]=0;}
@@ -175,12 +192,18 @@ void srun_sha1_hex(const char*m,size_t n,char*out){memset(out,'b',40);out[40]=0;
 void srun_encode_info(const char*j,const char*t,char*out,size_t n){strlcpy(last_json,j,sizeof(last_json));strlcpy(out,"{SRBX1}a+/=",n);}
 esp_err_t http_get_capture(const char*u,int timeout,http_resp_t*r){
  memset(r,0,sizeof(*r));r->status=200;calls++;
- if(!strcmp(u,APP_PROBE_URL_PRIMARY))r->status=primary_status;
- else if(!strcmp(u,APP_PROBE_URL_SECONDARY)){r->status=secondary_status;strlcpy(r->location,"http://portal.test/login?ac_id=9",sizeof(r->location));}
- else if(strstr(u,"get_challenge"))strlcpy(r->body,"jsonp({\"challenge\":\"token\",\"client_ip\":\"10.1.2.3\"})",sizeof(r->body));
- else if(strstr(u,"action=login")){strlcpy(last_login,u,sizeof(last_login));strlcpy(r->body,"jsonp({\"error\":\"ok\",\"suc_msg\":\"login_ok\"})",sizeof(r->body));}
+ assert(!strstr(u,"http://0.0.0.0") && !strstr(u,"https://0.0.0.0"));
+ if(blocked_host[0] && !strncmp(u,blocked_host,strlen(blocked_host)))return ESP_FAIL;
+ if(!strcmp(u,APP_PROBE_URL_PRIMARY)){r->status=primary_status;strlcpy(r->location,primary_location,sizeof(r->location));}
+ else if(!strcmp(u,APP_PROBE_URL_SECONDARY)){r->status=secondary_status;strlcpy(r->location,secondary_location,sizeof(r->location));}
+ else if(strstr(u,"get_challenge")){++challenges;strlcpy(r->body,"jsonp({\"challenge\":\"token\",\"client_ip\":\"10.1.2.3\"})",sizeof(r->body));}
+ else if(strstr(u,"action=login")){++logins;strlcpy(last_login,u,sizeof(last_login));strlcpy(r->body,"jsonp({\"error\":\"ok\",\"suc_msg\":\"login_ok\"})",sizeof(r->body));}
  else if(strstr(u,"action=logout"))strlcpy(r->body,"jsonp({\"error\":\"ok\",\"suc_msg\":\"logout_ok\"})",sizeof(r->body));
- else if(strstr(u,"rad_user_info"))strlcpy(r->body,"jsonp({\"user_name\":\"old-account\"})",sizeof(r->body));
+ else if(strstr(u,"rad_user_info")){
+  ++queries;if(info_mode==INFO_FAIL)return ESP_FAIL;
+  strlcpy(r->body,info_mode==INFO_ONLINE?"jsonp({\"user_name\":\"old-account\"})":
+    info_mode==INFO_OFFLINE?"jsonp({\"error\":\"not_online_error\"})":"<html>unrelated, page</html>",sizeof(r->body));
+ }
  else r->status=503;
  return ESP_OK;
 }
@@ -188,17 +211,48 @@ int main(void){
  portal_info_t pi;char detail[96],user[64];
  int errors[]={403,500,503};
  for(size_t i=0;i<3;i++){primary_status=errors[i];calls=0;assert(srun_probe(&pi)==PROBE_ONLINE && calls==2);}
+ primary_status=200;calls=0;assert(srun_probe(&pi)==PROBE_ONLINE && calls==2 && !queries && !challenges);
+ primary_status=302;strlcpy(primary_location,"http://portal.test/srun_portal_pc?ac_id=9",sizeof(primary_location));
+ calls=0;assert(srun_probe(&pi)==PROBE_ONLINE && calls==2 && !queries && !cached);
+ primary_location[0]=0;
  primary_status=503;secondary_status=302;calls=0;
+ strlcpy(secondary_location,"http://portal.test/login?ac_id=9",sizeof(secondary_location));
  assert(srun_probe(&pi)==PROBE_NEED_AUTH && !strcmp(pi.portal_base,"http://portal.test") && !strcmp(pi.ac_id,"9"));
+ assert(queries==1 && cached && !challenges && !logins);
+ cached=false;primary_status=200;secondary_status=200;secondary_location[0]=0;info_mode=INFO_ONLINE;
+ assert(srun_probe(&pi)==PROBE_NO_LINK && strstr(pi.detail,"在线") && !challenges && !logins);
+ info_mode=INFO_HTML;assert(srun_probe(&pi)==PROBE_NO_LINK && !challenges && !logins);
+ strlcpy(fallback_host,"http://0.0.0.0",sizeof(fallback_host));cached=true;
+ strlcpy(cached_host,"http://0.0.0.0:80",sizeof(cached_host));strlcpy(cached_acid,"3",sizeof(cached_acid));strlcpy(cached_ssid,"test",sizeof(cached_ssid));
+ const int before_queries=queries;
+ assert(srun_probe(&pi)==PROBE_NO_LINK && !pi.portal_base[0] && queries==before_queries);
+ assert(strstr(pi.detail,"未发现") && !challenges && !logins);
+ calls=0;assert(srun_login(&pi,"user","password","",detail,sizeof(detail))==LOGIN_FAIL && !calls);
+ assert(!srun_logout(&pi,"user",detail,sizeof(detail)) && !calls);
+ assert(srun_online_user(&pi,user,sizeof(user))==ESP_ERR_INVALID_STATE && !calls);
+ cached=false;strlcpy(fallback_host,"http://fallback.test",sizeof(fallback_host));
+ portal_defaults(&pi);
+ assert(!parse_location("http://router.test/login",&pi));
+ assert(!parse_location("http://0.0.0.0/srun_portal_pc?ac_id=3",&pi));
+ assert(!parse_location("http://portal.test/login?ac_id=3oops",&pi));
+ assert(parse_location("http://portal.test:8080?ac_id=9",&pi) && !strcmp(pi.portal_base,"http://portal.test:8080"));
+ assert(parse_location("https://portal.test/srun_portal_success?ac_id=3&theme=pro",&pi) && !strcmp(pi.ac_id,"3"));
  primary_status=204;calls=0;assert(srun_probe(&pi)==PROBE_ONLINE && calls==1);
+ primary_status=503;secondary_status=503;info_mode=INFO_OFFLINE;
+ assert(srun_probe(&pi)==PROBE_NEED_AUTH && !strcmp(pi.portal_base,"http://fallback.test"));
+ cached=true;strlcpy(cached_host,"http://stale.test",sizeof(cached_host));
+ strlcpy(cached_acid,"1",sizeof(cached_acid));strlcpy(cached_ssid,"test",sizeof(cached_ssid));
+ strlcpy(blocked_host,cached_host,sizeof(blocked_host));
+ assert(srun_probe(&pi)==PROBE_NEED_AUTH && !strcmp(pi.portal_base,"http://fallback.test"));
+ blocked_host[0]=0;
  strlcpy(pi.portal_base,"http://portal.test",sizeof(pi.portal_base));strlcpy(pi.ac_id,"9",sizeof(pi.ac_id));
  assert(srun_login(&pi,"u+&","a\"b\\c","@x",detail,sizeof(detail))==LOGIN_OK);
  assert(strstr(last_json,"a\\\"b\\\\c") && strstr(last_login,"username=u%2B%26%40x"));
  char longpass[64];memset(longpass,'\\',63);longpass[63]=0;
  assert(srun_login(&pi,"normal",longpass,"",detail,sizeof(detail))==LOGIN_OK);
- assert(srun_online_user(&pi,user,sizeof(user))==ESP_OK && !strcmp(user,"old-account"));
+ info_mode=INFO_ONLINE;assert(srun_online_user(&pi,user,sizeof(user))==ESP_OK && !strcmp(user,"old-account"));
  assert(srun_logout(&pi,user,detail,sizeof(detail)));
- puts("PASS HTTP fallback, secondary Portal discovery, escaped credentials, query and logout");
+ puts("PASS ambiguous HTTP 200/302, secondary 204, verified SRun discovery, invalid Portal guards, cache, credentials and logout");
 }
 '''
 
@@ -216,6 +270,10 @@ login_result_t srun_login(const portal_info_t*pi,const char*u,const char*p,const
  login_count++;strlcpy(online_user,u,sizeof(online_user));strlcpy(d,"ok",n);return LOGIN_OK;
 }
 int main(void){
+ assert(run_cycle("wifi","new","password",false));
+ assert(!logout_count && !login_count && !strcmp(s_st.account,"old"));
+ query_error=ESP_ERR_NOT_FOUND;assert(run_cycle("wifi","new","password",false) && !login_count);
+ query_error=ESP_OK;probe_count=0;
  assert(run_cycle("wifi","new","password",true));
  assert(logout_count==1 && login_count==1 && probe_count==2 && !strcmp(online_user,"new"));
  assert(run_cycle("wifi","new","password",false));assert(logout_count==1 && login_count==1);
@@ -557,6 +615,56 @@ int main(void){
 }
 '''
 
+TRANSPORT_TEST = r'''
+#include "common.h"
+typedef struct esp_http_client_event {
+ int event_id;void *user_data;char *header_key,*header_value;
+} esp_http_client_event_t;
+#define HTTP_EVENT_ON_HEADER 1
+typedef struct {
+ const char *url;int timeout_ms;bool disable_auto_redirect;
+ int buffer_size,buffer_size_tx;
+ esp_err_t (*event_handler)(esp_http_client_event_t *);void *user_data;
+} esp_http_client_config_t;
+typedef void *esp_http_client_handle_t;
+static esp_http_client_config_t config;
+static bool init_fail,open_fail,headers_fail;
+static int cleanup,closed,status=302;
+static char *location="http://portal.test/srun_portal_pc?ac_id=3";
+static esp_http_client_handle_t esp_http_client_init(const esp_http_client_config_t *c){config=*c;return init_fail?NULL:(void *)1;}
+static int esp_http_client_set_header(void *c,const char *k,const char *v){return ESP_OK;}
+static int esp_http_client_open(void *c,int len){return open_fail?ESP_FAIL:ESP_OK;}
+static int64_t esp_http_client_fetch_headers(void *c){
+ if(headers_fail)return -1;
+ if(location){
+  esp_http_client_event_t e={.event_id=HTTP_EVENT_ON_HEADER,.user_data=config.user_data,
+   .header_key="lOcAtIoN",.header_value=location};
+  assert(config.event_handler && config.event_handler(&e)==ESP_OK);
+ }
+ return 0;
+}
+static int esp_http_client_get_status_code(void *c){return status;}
+static int esp_http_client_read(void *c,char *out,int n){return 0;}
+static int esp_http_client_close(void *c){++closed;return ESP_OK;}
+static int esp_http_client_cleanup(void *c){++cleanup;return ESP_OK;}
+#include "http_util.c"
+int main(void){
+ http_resp_t response;
+ assert(http_get_capture("http://probe.test",8000,&response)==ESP_OK);
+ assert(config.disable_auto_redirect && response.status==302 && !strcmp(response.location,location));
+ assert(cleanup==1 && closed==1);
+ location=NULL;status=204;
+ assert(http_get_capture("http://probe.test",8000,&response)==ESP_OK && response.status==204 && !response.location[0]);
+ char too_long[256];memset(too_long,'a',sizeof(too_long)-1);too_long[255]=0;location=too_long;
+ assert(http_get_capture("http://probe.test",8000,&response)==ESP_OK && !response.location[0]);
+ headers_fail=true;assert(http_get_capture("http://probe.test",8000,&response)==ESP_FAIL && cleanup==4 && closed==3);
+ headers_fail=false;open_fail=true;assert(http_get_capture("http://probe.test",8000,&response)==ESP_FAIL && cleanup==5);
+ open_fail=false;init_fail=true;assert(http_get_capture("http://probe.test",8000,&response)==ESP_FAIL && cleanup==5);
+ assert(http_get_capture("http://probe.test",8000,NULL)==ESP_ERR_INVALID_ARG);
+ puts("PASS real HTTP transport: response Location callback, case-insensitive headers, reset, truncation and failure cleanup");
+}
+'''
+
 gcc = shutil.which("gcc")
 if not gcc:
     raise SystemExit("gcc is required for host C regression tests")
@@ -564,7 +672,7 @@ for name, code, helpers in (("http", HTTP_TEST, True), ("battery", BATTERY_TEST,
                             ("srun", SRUN_TEST, True), ("guard", GUARD_TEST, False),
                             ("power", POWER_TEST, False), ("display", DISPLAY_TEST, False),
                             ("recovery", RECOVERY_TEST, False), ("wifi", WIFI_TEST, False),
-                            ("wifi_ui", WIFI_UI_TEST, False)):
+                            ("wifi_ui", WIFI_UI_TEST, False), ("transport", TRANSPORT_TEST, False)):
     src = OUT / f"{name}_test.c"
     src.write_text(code, encoding="utf-8")
     exe = OUT / (name + (".exe" if __import__("os").name == "nt" else ""))

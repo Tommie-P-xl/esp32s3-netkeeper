@@ -14,11 +14,41 @@
 
 static const char *TAG = "srun";
 
+/* 只取 scheme://host[:port]；查询参数不能混入服务器主机。 */
+static bool portal_origin(const char *url, char *out, size_t cap)
+{
+    const char *host;
+    if (!strncmp(url, "http://", 7)) host = url + 7;
+    else if (!strncmp(url, "https://", 8)) host = url + 8;
+    else return false;
+    const size_t authority = strcspn(host, "/?#");
+    const size_t n = (size_t)(host - url) + authority;
+    if (!authority || n >= cap) return false;
+    for (size_t i = 0; i < authority; ++i) {
+        if ((unsigned char)host[i] <= ' ' || strchr("@\\\"'<>", host[i])) return false;
+    }
+    const size_t host_len = strcspn(host, ":/?#");
+    if (!host_len || (host_len == 7 && !strncmp(host, "0.0.0.0", 7)) ||
+        !strncmp(host, "[::]", 4)) return false;
+    memcpy(out, url, n);
+    out[n] = '\0';
+    return true;
+}
+
+bool srun_portal_configured(const portal_info_t *pi)
+{
+    char origin[sizeof(pi->portal_base)];
+    return portal_origin(pi->portal_base, origin, sizeof(origin)) &&
+           !strcmp(origin, pi->portal_base) && pi->ac_id[0] &&
+           strspn(pi->ac_id, "0123456789") == strlen(pi->ac_id);
+}
+
 /* 只缓存发现过的 Portal 和对应 WiFi，不保存认证密码。在线重启后仍能注销旧账号。 */
 static void portal_defaults(portal_info_t *pi)
 {
     strlcpy(pi->portal_base, APP_PORTAL_FALLBACK_HOST, sizeof(pi->portal_base));
     strlcpy(pi->ac_id, APP_PORTAL_FALLBACK_ACID, sizeof(pi->ac_id));
+    if (!srun_portal_configured(pi)) pi->portal_base[0] = '\0';
     nvs_handle_t h;
     if (nvs_open("srun", NVS_READONLY, &h) != ESP_OK) return;
     char ssid[33] = "", saved[33] = "", host[64] = "", acid[8] = "";
@@ -27,15 +57,17 @@ static void portal_defaults(portal_info_t *pi)
     if (nvs_get_str(h, "ssid", saved, &ns) == ESP_OK && !strcmp(ssid, saved) &&
         nvs_get_str(h, "host", host, &nh) == ESP_OK &&
         nvs_get_str(h, "acid", acid, &na) == ESP_OK && host[0] && acid[0]) {
-        strlcpy(pi->portal_base, host, sizeof(pi->portal_base));
-        strlcpy(pi->ac_id, acid, sizeof(pi->ac_id));
+        portal_info_t cached = {0};
+        strlcpy(cached.portal_base, host, sizeof(cached.portal_base));
+        strlcpy(cached.ac_id, acid, sizeof(cached.ac_id));
+        if (srun_portal_configured(&cached)) *pi = cached;
     }
     nvs_close(h);
 }
 
 static void portal_remember(const portal_info_t *pi)
 {
-    if (!strcmp(pi->portal_base, "http://0.0.0.0")) return;
+    if (!srun_portal_configured(pi)) return;
     portal_info_t old = {0};
     portal_defaults(&old);
     if (!strcmp(old.portal_base, pi->portal_base) && !strcmp(old.ac_id, pi->ac_id)) return;
@@ -126,36 +158,20 @@ static bool json_get(const char *json, const char *key, char *out, size_t cap)
 }
 
 /* 从 Location 里抠出 http://host 与 ac_id */
-static void parse_location(const char *loc, portal_info_t *pi)
+static bool parse_location(const char *loc, portal_info_t *pi)
 {
-    portal_defaults(pi);
-
-    if (loc == NULL || loc[0] == '\0') {
-        return;
-    }
-
-    if (strncmp(loc, "http://", 7) == 0 || strncmp(loc, "https://", 8) == 0) {
-        const char *host_start = strstr(loc, "//");
-        const char *slash = (host_start != NULL) ? strchr(host_start + 2, '/') : NULL;
-        const size_t host_len = (slash != NULL)
-                                    ? (size_t)(slash - loc)
-                                    : strlen(loc);
-        if (host_len > 0 && host_len < sizeof(pi->portal_base)) {
-            memcpy(pi->portal_base, loc, host_len);
-            pi->portal_base[host_len] = '\0';
-        }
-    }
-
+    if (!loc || !portal_origin(loc, pi->portal_base, sizeof(pi->portal_base))) return false;
+    bool identified = strstr(loc, "/srun_portal") != NULL;
     const char *ac = strstr(loc, "ac_id=");
-    if (ac != NULL) {
+    if (ac && ac > loc && (ac[-1] == '?' || ac[-1] == '&')) {
         ac += 6;
-        size_t i = 0;
-        while (ac[i] >= '0' && ac[i] <= '9' && i < sizeof(pi->ac_id) - 1) {
-            pi->ac_id[i] = ac[i];
-            i++;
-        }
-        pi->ac_id[i] = '\0';
+        const size_t n = strspn(ac, "0123456789");
+        if (!n || n >= sizeof(pi->ac_id) || (ac[n] && ac[n] != '&' && ac[n] != '#')) return false;
+        memcpy(pi->ac_id, ac, n);
+        pi->ac_id[n] = '\0';
+        identified = true;
     }
+    return identified && srun_portal_configured(pi);
 }
 
 /* ---------------------------------------------------------------- probe */
@@ -167,10 +183,7 @@ static probe_result_t probe_response(const http_resp_t *r, portal_info_t *pi)
         return PROBE_ONLINE;
     }
     if ((r->status >= 300 && r->status < 400) || r->status == 200) {
-        parse_location(r->location, pi);
-        snprintf(pi->detail, sizeof(pi->detail), "需要校园网认证（HTTP %d）", r->status);
-        portal_remember(pi);
-        return PROBE_NEED_AUTH;
+        if (parse_location(r->location, pi)) return PROBE_NEED_AUTH;
     }
     return PROBE_NO_LINK;
 }
@@ -186,24 +199,52 @@ probe_result_t srun_probe(portal_info_t *pi)
         return PROBE_NO_LINK;
     }
     probe_result_t res = PROBE_NO_LINK;
+    const portal_info_t defaults = *pi;
+    portal_info_t candidate = {0};
     const char *urls[] = {APP_PROBE_URL_PRIMARY, APP_PROBE_URL_SECONDARY};
     for (size_t i = 0; i < sizeof(urls) / sizeof(urls[0]); ++i) {
         const esp_err_t err = http_get_capture(urls[i], APP_HTTP_TIMEOUT_MS, r);
         if (err == ESP_OK) {
-            res = probe_response(r, pi);
-            if (res != PROBE_NO_LINK) goto done;
-            ESP_LOGW(TAG, "probe HTTP %d, trying next endpoint", r->status);
+            portal_info_t found = defaults;
+            res = probe_response(r, &found);
+            if (res == PROBE_ONLINE) { *pi = defaults; goto done; }
+            if (res == PROBE_NEED_AUTH) candidate = found;
+            ESP_LOGW(TAG, "probe HTTP %d, checking next endpoint", r->status);
+        } else {
+            ESP_LOGW(TAG, "probe endpoint %u failed: %s", (unsigned)i + 1, esp_err_to_name(err));
         }
     }
-    char url[160];
-    snprintf(url, sizeof(url), "%s/srun_portal_pc?ac_id=%s&theme=pro", pi->portal_base, pi->ac_id);
-    if (http_get_capture(url, APP_HTTP_TIMEOUT_MS, r) == ESP_OK &&
-        (r->status == 200 || (r->status >= 300 && r->status < 400))) {
-        strlcpy(pi->detail, "兜底 Portal 可达", sizeof(pi->detail));
-        res = PROBE_NEED_AUTH;
-    } else {
-        strlcpy(pi->detail, "外网与 Portal 均不可达", sizeof(pi->detail));
+    res = PROBE_NO_LINK;
+    *pi = defaults;
+    /* HTTP 200/302 本身不是 SRun 证据。读取在线信息接口确认协议及会话状态，
+     * 不发送登录或注销请求；任一外网探测成功时不会走到这里。 */
+    portal_info_t configured = {0};
+    strlcpy(configured.portal_base, APP_PORTAL_FALLBACK_HOST, sizeof(configured.portal_base));
+    strlcpy(configured.ac_id, APP_PORTAL_FALLBACK_ACID, sizeof(configured.ac_id));
+    const portal_info_t choices[] = {candidate, defaults, configured};
+    for (size_t i = 0; i < sizeof(choices) / sizeof(choices[0]); ++i) {
+        if (!srun_portal_configured(&choices[i])) continue;
+        bool duplicate = false;
+        for (size_t j = 0; j < i; ++j) {
+            if (!strcmp(choices[j].portal_base, choices[i].portal_base)) duplicate = true;
+        }
+        if (duplicate) continue;
+        char online_user[64];
+        const esp_err_t query = srun_online_user(&choices[i], online_user, sizeof(online_user));
+        if (query == ESP_OK || query == ESP_ERR_NOT_FOUND) {
+            *pi = choices[i];
+            portal_remember(pi);
+            if (query == ESP_ERR_NOT_FOUND) {
+                strlcpy(pi->detail, "需要校园网认证", sizeof(pi->detail));
+                res = PROBE_NEED_AUTH;
+            } else {
+                strlcpy(pi->detail, "认证会话在线，外网检测异常", sizeof(pi->detail));
+            }
+            goto done;
+        }
     }
+    strlcpy(pi->detail, srun_portal_configured(pi) ? "外网与认证服务器均不可达或响应异常" :
+            "未发现有效认证地址，请配置 Portal", sizeof(pi->detail));
 done:
     free(r);
     return res;
@@ -213,7 +254,7 @@ done:
 esp_err_t srun_online_user(const portal_info_t *pi, char *user, size_t cap)
 {
     user[0] = '\0';
-    if (!strcmp(pi->portal_base, "http://0.0.0.0")) return ESP_ERR_INVALID_STATE;
+    if (!srun_portal_configured(pi)) return ESP_ERR_INVALID_STATE;
     http_resp_t *r = calloc(1, sizeof(*r));
     if (!r) return ESP_ERR_NO_MEM;
     char url[192];
@@ -243,6 +284,7 @@ esp_err_t srun_online_user(const portal_info_t *pi, char *user, size_t cap)
 /* 注销前用 challenge 取得服务端看到的 IP，兼容设备在 NAT 后的情况。 */
 bool srun_logout(const portal_info_t *pi, const char *user, char *detail, size_t cap)
 {
+    if (!srun_portal_configured(pi)) { strlcpy(detail, "未配置有效认证地址", cap); return false; }
     http_resp_t *r = calloc(1, sizeof(*r));
     if (!r) { strlcpy(detail, "内存不足", cap); return false; }
     char encoded[192], url[512], ip[20] = "";
@@ -284,6 +326,10 @@ typedef struct {
 login_result_t srun_login(const portal_info_t *pi, const char *user, const char *pass,
                          const char *domain, char *detail, size_t detail_cap)
 {
+    if (!srun_portal_configured(pi)) {
+        strlcpy(detail, "未配置有效认证地址", detail_cap);
+        return LOGIN_FAIL;
+    }
     login_workspace_t *w = calloc(1, sizeof(*w));
     if (!w) { strlcpy(detail, "内存不足", detail_cap); return LOGIN_FAIL; }
     login_result_t result = LOGIN_FAIL;

@@ -3,6 +3,7 @@
 #include <stdbool.h>
 #include <stdio.h>
 #include <string.h>
+#include <strings.h>
 
 #include "esp_http_client.h"
 #include "esp_log.h"
@@ -11,6 +12,20 @@ static const char *TAG = "http";
 
 #define UA_STR "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " \
                "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+
+static esp_err_t capture_header(esp_http_client_event_t *event)
+{
+    if (event->event_id == HTTP_EVENT_ON_HEADER && event->user_data &&
+        event->header_key && event->header_value &&
+        strcasecmp(event->header_key, "Location") == 0) {
+        http_resp_t *out = event->user_data;
+        /* 截断跳转地址不能用于认证发现，保留为空让上层继续其它探测。 */
+        if (strlcpy(out->location, event->header_value, sizeof(out->location)) >= sizeof(out->location)) {
+            out->location[0] = '\0';
+        }
+    }
+    return ESP_OK;
+}
 
 esp_err_t http_get_capture(const char *url, int timeout_ms, http_resp_t *out)
 {
@@ -25,6 +40,8 @@ esp_err_t http_get_capture(const char *url, int timeout_ms, http_resp_t *out)
         .url = url,
         .timeout_ms = timeout_ms,
         .disable_auto_redirect = true,
+        .event_handler = capture_header,
+        .user_data = out,
         /* 2048 不是随手写的：SRun 的登录响应会带一串 Set-Cookie，实测响应头
          * 1226 字节，512 会直接报 ESP_ERR_HTTP_HEADER_TOO_LONG。 */
         .buffer_size = 2048,
@@ -50,14 +67,11 @@ esp_err_t http_get_capture(const char *url, int timeout_ms, http_resp_t *out)
 
     if (esp_http_client_fetch_headers(cli) < 0) {
         ESP_LOGW(TAG, "fetch headers failed: %s", url);
+        esp_http_client_cleanup(cli);
+        return ESP_FAIL;
     }
 
     out->status = esp_http_client_get_status_code(cli);
-
-    char *loc = NULL;
-    if (esp_http_client_get_header(cli, "Location", &loc) == ESP_OK && loc != NULL) {
-        strlcpy(out->location, loc, sizeof(out->location));
-    }
 
     /* 把 body 读干净：只保留前 HTTP_RESP_BODY_MAX-1 字节，其余丢弃，
      * 这样连接能正常关闭，不会卡在 TIME_WAIT 里。 */

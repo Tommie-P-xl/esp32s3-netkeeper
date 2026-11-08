@@ -27,6 +27,9 @@ typedef struct {
     char detail[96];      /* 给人看的一句话 */
 } portal_info_t;
 
+/** @brief 主机为可用 HTTP(S) origin 且 ac_id 有效；空地址、占位地址不可用。 */
+bool srun_portal_configured(const portal_info_t *pi);
+
 typedef enum {
     PROBE_ONLINE = 0,  /* 外网通 */
     PROBE_NEED_AUTH,   /* 被劫持到 Portal，需要认证 */

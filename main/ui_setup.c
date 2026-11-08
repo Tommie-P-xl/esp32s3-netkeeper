@@ -377,7 +377,7 @@ static void acct_use_cb(lv_event_t *e)
     const char *user = (const char *)lv_event_get_user_data(e);
     if (db_set_current_acct(s_acct_ssid, user) == ESP_OK) {
         db_set_active_ssid(s_acct_ssid);
-        net_guard_trigger();
+        net_guard_switch_account(s_acct_ssid, user);
         ui_toast("已设为自动登录账号");
     } else {
         ui_toast("切换失败");
@@ -540,7 +540,7 @@ static void do_add_acct(void)
     }
     db_set_current_acct(s_acct_ssid, user);
     db_set_active_ssid(s_acct_ssid);
-    net_guard_trigger();
+    net_guard_switch_account(s_acct_ssid, user);
 
     ui_toast("账号已保存");
     ui_setup_open_accounts();
