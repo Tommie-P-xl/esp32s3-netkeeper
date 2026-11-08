@@ -92,6 +92,7 @@
 
 <script>
 var lastNets = [];
+var renderedNets = '';
 var TOKEN = localStorage.getItem('pg_token') || '';
 
 document.getElementById('gate_url').textContent = location.origin;
@@ -179,8 +180,17 @@ function load(){
 function renderNets(nets){
   lastNets = nets;
   var host = document.getElementById('nets');
+  var signature = JSON.stringify(nets);
+  if(signature === renderedNets) return;
+  /* 状态仍每 3 秒更新，编辑中的输入框保留到失焦后的下一次刷新，避免打断键盘和输入法。 */
+  var focused = document.activeElement;
+  if(host.contains(focused) && focused.tagName === 'INPUT') return;
+  var drafts = Array.from(host.querySelectorAll('input')).map(function(input){
+    return {id: input.id, value: input.value};
+  });
   if(!nets.length){
     host.innerHTML = '<div class="empty">还没有保存任何 WiFi。用下面的表单添加，或在板子的屏幕上配网。</div>';
+    renderedNets = signature;
     return;
   }
   host.innerHTML = nets.map(function(n){
@@ -205,6 +215,11 @@ function renderNets(nets){
       '</div>' +
     '</div>';
   }).join('');
+  drafts.forEach(function(draft){
+    var input = document.getElementById(draft.id);
+    if(input && host.contains(input)) input.value = draft.value;
+  });
+  renderedNets = signature;
 }
 
 function addWifi(){
@@ -217,7 +232,16 @@ function addAcct(ssid){
   var u = document.getElementById('u_' + ssid).value.trim();
   var p = document.getElementById('p_' + ssid).value;
   if(!u){ alert('请填写账号'); return; }
-  post('/api/acct', {ssid: ssid, user: u, pass: p, use: 1});
+  return post('/api/acct', {ssid: ssid, user: u, pass: p, use: 1}).then(function(j){
+    /* 仅清空本次成功提交的内容；失败或提交后继续编辑时保留草稿。 */
+    var user = document.getElementById('u_' + ssid);
+    var pass = document.getElementById('p_' + ssid);
+    if(j && j.ok && user && pass && user.value.trim() === u && pass.value === p){
+      user.value = '';
+      pass.value = '';
+    }
+    return j;
+  });
 }
 function delAcct(ssid, user){
   if(!confirm('删除账号 ' + user + ' ?')) return;
