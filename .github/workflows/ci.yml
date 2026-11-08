@@ -126,14 +126,12 @@ jobs:
           更新记录见仓库中的 CHANGELOG.md。
           EOF
 
-          tag_path=$(python3 -c 'import os, urllib.parse; print(urllib.parse.quote(os.environ["GITHUB_REF_NAME"], safe=""))')
-          if gh api --include "repos/${GITHUB_REPOSITORY}/releases/tags/${tag_path}" > /tmp/release-response 2> /tmp/release-error; then
+          # 按 tag 查询只返回公开 Release；列表接口也包含当前 token 可见的草稿。
+          release_id=$(gh api --paginate "repos/${GITHUB_REPOSITORY}/releases?per_page=100" --jq ".[] | select(.tag_name == \"${GITHUB_REF_NAME}\") | .id")
+          if [[ -n "$release_id" ]]; then
             gh release edit "$GITHUB_REF_NAME" --title "esp32s3-netkeeper v${version}" --notes-file release-notes.md
-          elif grep -Eq '^HTTP/[0-9.]+ 404([[:space:]]|$)' /tmp/release-response; then
+          else
             gh release create "$GITHUB_REF_NAME" --title "esp32s3-netkeeper v${version}" --notes-file release-notes.md --verify-tag
-          elif ! grep -Eq '^HTTP/[0-9.]+ 404([[:space:]]|$)' /tmp/release-response; then
-            cat /tmp/release-error >&2
-            exit 1
           fi
           gh release upload "$GITHUB_REF_NAME" --clobber \
             esp32s3-netkeeper-firmware.zip firmware/build/esp32s3_netkeeper.bin \
