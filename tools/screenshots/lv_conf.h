@@ -1,0 +1,19 @@
+#ifndef LV_CONF_H
+#define LV_CONF_H
+/* Native, headless LVGL. UI sources/font are shared with the firmware. */
+#define LV_COLOR_FORMAT_DEFAULT LV_COLOR_FORMAT_RGB565
+#define LV_USE_OS 0
+#define LV_MEM_SIZE (16 * 1024 * 1024)
+#define LV_USE_SNAPSHOT 1
+#define LV_USE_FONT_COMPRESSED 1
+#define LV_FONT_MONTSERRAT_14 1
+#define LV_FONT_MONTSERRAT_24 1
+#define LV_FONT_MONTSERRAT_28 1
+#define LV_FONT_MONTSERRAT_40 1
+#define LV_THEME_DEFAULT_DARK 0
+#define LV_THEME_DEFAULT_GROW 1
+#define LV_THEME_DEFAULT_TRANSITION_TIME 80
+#define LV_USE_LOG 1
+#define LV_LOG_LEVEL LV_LOG_LEVEL_WARN
+#define LV_LOG_PRINTF 1
+#endif

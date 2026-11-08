@@ -13,6 +13,8 @@ rc.txt
 /tests/
 /.local/
 /.codegraph/
+/.playwright-cli/
+/output/playwright/
 __pycache__/
 *.pyc
 

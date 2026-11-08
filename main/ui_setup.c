@@ -21,6 +21,10 @@
 static lv_obj_t *s_scr_wifi;
 static lv_obj_t *s_list_wifi;
 static lv_obj_t *s_wifi_tip;
+static lv_obj_t *s_wifi_refresh_btn;
+static lv_obj_t *s_wifi_refresh_icon;
+static lv_obj_t *s_wifi_refresh_spinner;
+static lv_obj_t *s_wifi_refresh_text;
 
 static lv_obj_t *s_scr_pass;
 static lv_obj_t *s_pass_ta;
@@ -40,7 +44,7 @@ static volatile bool s_scanning;
 
 /* 断点计数：扫描任务卡住时，靠它从网页看走到哪一步了（这个任务的串口
  * 输出不可靠，不能用日志定位）。0=空闲 1=开始扫 2=扫完 3=拿到显示锁
- * 4=清空列表 5=行建完 6=放锁 7=结束 */
+ * 4=清空列表 5=行建完 7=结束 */
 static volatile int s_scan_stage;
 
 int ui_setup_scan_stage(void)
@@ -58,6 +62,13 @@ static lv_obj_t *s_row_connected[MAX_ROWS];
 static int s_wifi_rows;
 static char s_row_user[MAX_ROWS][DB_USER_LEN];
 static wifi_ap_t s_aps[MAX_AP];
+/* 当前列表的扫描快照，仅在显示锁内访问；后台扫描使用独立的 s_aps。 */
+static wifi_ap_t s_wifi_aps[MAX_AP];
+static bool s_row_saved[MAX_ROWS];
+static lv_obj_t *s_delete_modal;
+/* 确认框独立保存目标，后台扫描重建列表不能改变将要删除的对象。 */
+static char s_delete_ssid[DB_SSID_LEN];
+static char s_delete_user[DB_USER_LEN];
 
 /* ------------------------------------------------------------ 工具 */
 
@@ -74,11 +85,137 @@ static bool net_saved(const char *ssid)
     return ok;
 }
 
+/* -------------------------------------------------- 删除确认 */
+
+static void close_delete_confirm(void)
+{
+    lv_obj_t *modal = s_delete_modal;
+    s_delete_modal = NULL;
+    s_delete_ssid[0] = s_delete_user[0] = '\0';
+    if (modal != NULL) {
+        lv_obj_delete(modal);
+    }
+}
+
+static void cancel_delete_cb(lv_event_t *e)
+{
+    (void)e;
+    close_delete_confirm();
+}
+
+static void confirm_delete_cb(lv_event_t *e)
+{
+    (void)e;
+    if (s_delete_modal == NULL) {
+        return;
+    }
+    char ssid[DB_SSID_LEN], user[DB_USER_LEN];
+    strlcpy(ssid, s_delete_ssid, sizeof(ssid));
+    strlcpy(user, s_delete_user, sizeof(user));
+    close_delete_confirm();
+
+    const bool account = user[0] != '\0';
+    const esp_err_t err = account ? db_remove_acct(ssid, user) : db_remove_net(ssid);
+    if (err == ESP_OK) {
+        ui_toast(account ? "已删除" : "已删除该网络");
+        net_guard_trigger();
+        if (account) {
+            ui_setup_open_accounts();
+        } else {
+            start_scan();
+        }
+    } else if (!account && err == ESP_ERR_INVALID_STATE) {
+        ui_toast("请先切换网络");
+    } else {
+        ui_toast("删除失败");
+    }
+}
+
+static void delete_modal_deleted_cb(lv_event_t *e)
+{
+    if (lv_event_get_target(e) == s_delete_modal) {
+        s_delete_modal = NULL;
+        s_delete_ssid[0] = s_delete_user[0] = '\0';
+    }
+}
+
+static void show_delete_confirm(const char *ssid, const char *user)
+{
+    if (s_delete_modal != NULL) {
+        return;
+    }
+    strlcpy(s_delete_ssid, ssid, sizeof(s_delete_ssid));
+    strlcpy(s_delete_user, user != NULL ? user : "", sizeof(s_delete_user));
+
+    s_delete_modal = lv_obj_create(lv_screen_active());
+    lv_obj_set_size(s_delete_modal, UI_W, UI_H);
+    lv_obj_set_pos(s_delete_modal, 0, 0);
+    lv_obj_set_style_bg_color(s_delete_modal, UI_COL_BG, 0);
+    lv_obj_set_style_bg_opa(s_delete_modal, LV_OPA_70, 0);
+    lv_obj_set_style_border_width(s_delete_modal, 0, 0);
+    lv_obj_set_style_radius(s_delete_modal, 0, 0);
+    lv_obj_set_style_pad_all(s_delete_modal, 0, 0);
+    ui_obj_scrollable(s_delete_modal, false);
+    ui_obj_clickable(s_delete_modal, true);
+    lv_obj_add_event_cb(s_delete_modal, delete_modal_deleted_cb, LV_EVENT_DELETE, NULL);
+
+    lv_obj_t *card = ui_row_card(s_delete_modal, 220);
+    lv_obj_set_size(card, 424, 220);
+    lv_obj_center(card);
+    lv_obj_set_style_pad_all(card, 20, 0);
+    lv_obj_set_style_bg_color(card, UI_COL_CARD2, 0);
+
+    lv_obj_t *title = ui_label(card, user != NULL ? "删除账号" : "删除 WiFi", &ui_font_18, UI_COL_TEXT);
+    lv_obj_set_pos(title, 0, 0);
+    lv_obj_t *target = ui_label(card, "", &ui_font_18, UI_COL_TEXT);
+    lv_label_set_text_fmt(target, "%s%s%s", s_delete_ssid, user != NULL ? "\n" : "", s_delete_user);
+    lv_obj_set_pos(target, 0, 34);
+    lv_obj_set_width(target, 384);
+    lv_label_set_long_mode(target, LV_LABEL_LONG_DOT);
+    lv_obj_set_height(target, 42);
+    lv_obj_t *hint = ui_label(card, "删除后需要重新添加", &ui_font_18, UI_COL_MUTED);
+    lv_obj_set_pos(hint, 0, 86);
+
+    lv_obj_t *cancel = ui_button(card, "取消", false, cancel_delete_cb, NULL);
+    lv_obj_set_pos(cancel, 0, 132);
+    lv_obj_set_size(cancel, 182, 42);
+    lv_obj_set_style_bg_color(cancel, UI_COL_CARD, 0);
+    lv_obj_t *confirm = ui_button(card, "确认删除", false, confirm_delete_cb, NULL);
+    lv_obj_set_pos(confirm, 202, 132);
+    lv_obj_set_size(confirm, 182, 42);
+    lv_obj_set_style_bg_color(confirm, UI_COL_RED, 0);
+}
+
 /* -------------------------------------------------- WiFi 列表 */
+
+/* 与实际任务状态对齐，不按动画时长猜测扫描何时结束。调用方持有显示锁。 */
+static void refresh_scan_control(void)
+{
+    if (s_wifi_refresh_btn == NULL) {
+        return;
+    }
+    const bool scanning = s_scanning;
+    if (lv_obj_has_state(s_wifi_refresh_btn, LV_STATE_DISABLED) == scanning) {
+        return;
+    }
+
+    ui_obj_hidden(s_wifi_refresh_icon, scanning);
+    ui_obj_hidden(s_wifi_refresh_spinner, !scanning);
+    lv_label_set_text(s_wifi_refresh_text, scanning ? "扫描中…" : "重新扫描");
+    if (scanning) {
+        lv_obj_add_state(s_wifi_refresh_btn, LV_STATE_DISABLED);
+        lv_spinner_set_anim_params(s_wifi_refresh_spinner, 1000, 200);
+    } else {
+        lv_obj_remove_state(s_wifi_refresh_btn, LV_STATE_DISABLED);
+        lv_anim_delete(s_wifi_refresh_spinner, NULL);
+    }
+}
 
 static void refresh_wifi_status(lv_timer_t *timer)
 {
     (void)timer;
+    /* 工作线程拿显示锁失败时，也由 LVGL 定时器收尾，避免转圈一直停不下来。 */
+    refresh_scan_control();
     if (s_scr_wifi == NULL || lv_screen_active() != s_scr_wifi) {
         return;
     }
@@ -118,16 +255,7 @@ static void row_ap_cb(lv_event_t *e)
 static void row_del_cb(lv_event_t *e)
 {
     const char *ssid = (const char *)lv_event_get_user_data(e);
-    const esp_err_t err = db_remove_net(ssid);
-    if (err == ESP_OK) {
-        ui_toast("已删除该网络");
-        net_guard_trigger();
-        start_scan();
-    } else if (err == ESP_ERR_INVALID_STATE) {
-        ui_toast("请先切换网络");
-    } else {
-        ui_toast("删除失败");
-    }
+    show_delete_confirm(ssid, NULL);
 }
 
 /*
@@ -142,6 +270,22 @@ static void row_del_cb(lv_event_t *e)
  * 后者把 esp_err_t 当 bool 返回，ESP_OK=0 成了 false —— `if (bsp_display_lock())`
  * 等于在拿到锁的时候跳过 unlock，锁被永久扣住。见 ui_common.h。
  */
+static bool scan_results_changed(int rows, const bool *saved)
+{
+    if (rows != s_wifi_rows) {
+        return true;
+    }
+    for (int i = 0; i < rows; i++) {
+        if (strcmp(s_aps[i].ssid, s_wifi_aps[i].ssid) != 0 ||
+            s_aps[i].rssi != s_wifi_aps[i].rssi ||
+            s_aps[i].authmode != s_wifi_aps[i].authmode ||
+            saved[i] != s_row_saved[i]) {
+            return true;
+        }
+    }
+    return false;
+}
+
 static void scan_task(void *arg)
 {
     (void)arg;
@@ -154,8 +298,7 @@ static void scan_task(void *arg)
     char sub[MAX_ROWS][72];
     const int rows = (n > 0) ? ((n < MAX_ROWS) ? n : MAX_ROWS) : 0;
     for (int i = 0; i < rows; i++) {
-        strlcpy(s_row_ssid[i], s_aps[i].ssid, sizeof(s_row_ssid[i]));
-        saved[i] = net_saved(s_row_ssid[i]);
+        saved[i] = net_saved(s_aps[i].ssid);
         snprintf(sub[i], sizeof(sub[i]), "%d dBm%s%s", s_aps[i].rssi,
                  (s_aps[i].authmode == WIFI_AUTH_OPEN) ? " · 开放" : "",
                  saved[i] ? " · 已保存" : "");
@@ -164,51 +307,60 @@ static void scan_task(void *arg)
     if (ui_lock(2000)) {
         s_scan_stage = 3;
         if (s_list_wifi != NULL) {
-            s_wifi_rows = 0;
-            lv_obj_clean(s_list_wifi);
-            s_scan_stage = 4;
-
-            if (n <= 0) {
-                lv_label_set_text(s_wifi_tip, n == 0 ? "没扫到 WiFi" : "扫描失败，稍后再试");
+            if (n < 0) {
+                /* 失败不覆盖上次列表。 */
+                lv_label_set_text(s_wifi_tip, "扫描失败，稍后再试");
             } else {
-                lv_label_set_text(s_wifi_tip, "");
+                lv_label_set_text(s_wifi_tip, n == 0 ? "没扫到 WiFi" : "");
+                if (scan_results_changed(rows, saved)) {
+                    s_wifi_rows = 0;
+                    lv_obj_clean(s_list_wifi);
+                    s_scan_stage = 4;
 
-                for (int i = 0; i < rows; i++) {
-                    lv_obj_t *row = ui_row_card(s_list_wifi, 52);
-                    ui_obj_clickable(row, true);
-                    lv_obj_add_event_cb(row, row_ap_cb, LV_EVENT_CLICKED, s_row_ssid[i]);
+                    for (int i = 0; i < rows; i++) {
+                        /* 老列表扫描期间仍可点击，不能在锁外改写它的回调载荷。 */
+                        strlcpy(s_row_ssid[i], s_aps[i].ssid, sizeof(s_row_ssid[i]));
+                        s_wifi_aps[i] = s_aps[i];
+                        s_row_saved[i] = saved[i];
+                        lv_obj_t *row = ui_row_card(s_list_wifi, 52);
+                        ui_obj_clickable(row, true);
+                        lv_obj_add_event_cb(row, row_ap_cb, LV_EVENT_CLICKED, s_row_ssid[i]);
 
-                    lv_obj_t *name = ui_label(row, s_row_ssid[i], &ui_font_18, UI_COL_TEXT);
-                    lv_obj_align(name, LV_ALIGN_LEFT_MID, 4, -8);
+                        lv_obj_t *name = ui_label(row, s_row_ssid[i], &ui_font_18, UI_COL_TEXT);
+                        lv_obj_align(name, LV_ALIGN_LEFT_MID, 4, -8);
 
-                    /* 这行混着中文（· 开放 / · 已保存），必须用 ui_font_18：
-                     * montserrat_14 没有这些字形，会画成方框。 */
-                    lv_obj_t *info = ui_label(row, sub[i], &ui_font_18, UI_COL_MUTED);
-                    lv_obj_align(info, LV_ALIGN_LEFT_MID, 4, 12);
+                        /* 这行混着中文（· 开放 / · 已保存），必须用 ui_font_18：
+                         * montserrat_14 没有这些字形，会画成方框。 */
+                        lv_obj_t *info = ui_label(row, sub[i], &ui_font_18, UI_COL_MUTED);
+                        lv_obj_align(info, LV_ALIGN_LEFT_MID, 4, 12);
 
-                    s_row_connected[i] = ui_label(row, "已连接", &ui_font_18, UI_COL_GREEN);
-                    lv_obj_align(s_row_connected[i], LV_ALIGN_RIGHT_MID, -84, 0);
-                    ui_obj_hidden(s_row_connected[i], true);
+                        s_row_connected[i] = ui_label(row, "已连接", &ui_font_18, UI_COL_GREEN);
+                        lv_obj_align(s_row_connected[i], LV_ALIGN_RIGHT_MID, -84, 0);
+                        ui_obj_hidden(s_row_connected[i], true);
 
-                    /* 已保存的网络给一个删除入口（需求：板上可直接删 WiFi）。
-                     * 按钮可点，点击不会冒泡到整行，所以不会误触发连接。 */
-                    if (saved[i]) {
-                        lv_obj_t *del = ui_button(row, "删除", false, row_del_cb, s_row_ssid[i]);
-                        lv_obj_set_size(del, 76, 34);
-                        lv_obj_align(del, LV_ALIGN_RIGHT_MID, -4, 0);
+                        /* 已保存的网络给一个删除入口（需求：板上可直接删 WiFi）。
+                         * 按钮可点，点击不会冒泡到整行，所以不会误触发连接。 */
+                        if (saved[i]) {
+                            lv_obj_t *del = ui_button(row, "删除", false, row_del_cb, s_row_ssid[i]);
+                            lv_obj_set_size(del, 76, 34);
+                            lv_obj_align(del, LV_ALIGN_RIGHT_MID, -4, 0);
+                        }
                     }
+                    s_wifi_rows = rows;
                 }
-                s_wifi_rows = rows;
                 refresh_wifi_status(NULL);
             }
             s_scan_stage = 5;
         }
+        s_scanning = false;
+        s_scan_stage = 7;
+        refresh_scan_control();
         ui_unlock();
-        s_scan_stage = 6;
+    } else {
+        s_scanning = false;
+        s_scan_stage = 7;
     }
 
-    s_scanning = false;
-    s_scan_stage = 7;
     vTaskDelete(NULL);
 }
 
@@ -218,12 +370,14 @@ static void start_scan(void)
         return;
     }
     s_scanning = true;
-    lv_label_set_text(s_wifi_tip, "扫描中…");
-    s_wifi_rows = 0;
-    lv_obj_clean(s_list_wifi);
+    s_scan_stage = 1;
+    refresh_scan_control();
+    /* 保留已有列表，后台扫描期间仍能选网、返回或进入账户页。 */
 
     if (xTaskCreate(scan_task, "wifi_scan", 4096, NULL, 4, NULL) != pdPASS) {
         s_scanning = false;
+        s_scan_stage = 7;
+        refresh_scan_control();
         lv_label_set_text(s_wifi_tip, "任务创建失败");
     }
 }
@@ -256,14 +410,18 @@ static void on_acct_from_wifi(lv_event_t *e)
 static void build_wifi_screen(void)
 {
     s_scr_wifi = ui_screen_new();
-    ui_header(s_scr_wifi, "选择 WiFi", on_wifi_back);
+    lv_obj_t *title = ui_header(s_scr_wifi, "选择 WiFi", on_wifi_back);
+    lv_obj_set_width(title, 88);
 
+    /* 提示放进标题栏中间，不再为通常为空的提示单独留一整行。 */
     s_wifi_tip = ui_label(s_scr_wifi, "", &ui_font_18, UI_COL_MUTED);
-    lv_obj_set_pos(s_wifi_tip, 26, 62);
+    lv_obj_set_pos(s_wifi_tip, 126, 20);
+    lv_obj_set_width(s_wifi_tip, 180);
+    lv_label_set_long_mode(s_wifi_tip, LV_LABEL_LONG_DOT);
 
     s_list_wifi = lv_obj_create(s_scr_wifi);
-    lv_obj_set_pos(s_list_wifi, 20, 92);
-    lv_obj_set_size(s_list_wifi, 440, 300);
+    lv_obj_set_pos(s_list_wifi, 20, 56);
+    lv_obj_set_size(s_list_wifi, 440, 336);
     lv_obj_set_style_bg_opa(s_list_wifi, LV_OPA_TRANSP, 0);
     lv_obj_set_style_border_width(s_list_wifi, 0, 0);
     lv_obj_set_style_pad_all(s_list_wifi, 6, 0);
@@ -274,6 +432,24 @@ static void build_wifi_screen(void)
     lv_obj_t *b1 = ui_button(s_scr_wifi, "重新扫描", false, on_rescan, NULL);
     lv_obj_set_pos(b1, 26, 406);
     lv_obj_set_size(b1, 200, 48);
+    lv_obj_set_style_pad_all(b1, 0, 0);
+    s_wifi_refresh_btn = b1;
+    s_wifi_refresh_text = lv_obj_get_child(b1, 0);
+    lv_obj_align(s_wifi_refresh_text, LV_ALIGN_CENTER, 18, 0);
+
+    s_wifi_refresh_icon = ui_label(b1, LV_SYMBOL_REFRESH,
+                                 &lv_font_montserrat_24, UI_COL_TEXT);
+    lv_obj_align(s_wifi_refresh_icon, LV_ALIGN_LEFT_MID, 24, 0);
+
+    s_wifi_refresh_spinner = lv_spinner_create(b1);
+    lv_obj_set_size(s_wifi_refresh_spinner, 26, 26);
+    lv_obj_align(s_wifi_refresh_spinner, LV_ALIGN_LEFT_MID, 24, 0);
+    lv_obj_set_style_arc_width(s_wifi_refresh_spinner, 3, LV_PART_MAIN);
+    lv_obj_set_style_arc_color(s_wifi_refresh_spinner, UI_COL_LINE, LV_PART_MAIN);
+    lv_obj_set_style_arc_width(s_wifi_refresh_spinner, 3, LV_PART_INDICATOR);
+    lv_obj_set_style_arc_color(s_wifi_refresh_spinner, UI_COL_SKY, LV_PART_INDICATOR);
+    lv_anim_delete(s_wifi_refresh_spinner, NULL);
+    ui_obj_hidden(s_wifi_refresh_spinner, true);
 
     lv_obj_t *b2 = ui_button(s_scr_wifi, "账户管理", true, on_acct_from_wifi, NULL);
     lv_obj_set_pos(b2, 254, 406);
@@ -287,6 +463,7 @@ void ui_setup_open_wifi(void)
         build_wifi_screen();
     }
     lv_screen_load(s_scr_wifi);
+    refresh_wifi_status(NULL);
     start_scan();
 }
 
@@ -387,13 +564,7 @@ static void acct_use_cb(lv_event_t *e)
 static void acct_del_cb(lv_event_t *e)
 {
     const char *user = (const char *)lv_event_get_user_data(e);
-    if (db_remove_acct(s_acct_ssid, user) == ESP_OK) {
-        ui_toast("已删除");
-        net_guard_trigger();
-        ui_setup_open_accounts();
-    } else {
-        ui_toast("删除失败");
-    }
+    show_delete_confirm(s_acct_ssid, user);
 }
 
 static void refresh_acct_list(void)
@@ -623,24 +794,3 @@ static void build_add_screen(void)
 
     lv_keyboard_set_textarea(kb, s_add_user);
 }
-
-#if APP_UI_CAPTURE_SETUP
-/* 抓图用：跳过真实点击流程直接进输入页，配 dump_fb 出截图 */
-void ui_setup_cap_pass(void)
-{
-    strlcpy(s_pending_ssid, "ExampleWiFi", sizeof(s_pending_ssid));
-    if (s_scr_pass == NULL) {
-        build_pass_screen();
-    }
-    lv_textarea_set_text(s_pass_ta, "");
-    lv_screen_load(s_scr_pass);
-}
-
-void ui_setup_cap_add(void)
-{
-    if (s_scr_add == NULL) {
-        build_add_screen();
-    }
-    lv_screen_load(s_scr_add);
-}
-#endif

@@ -601,6 +601,7 @@ static wifi_link_t link;
 static lv_obj_t *lv_screen_active(void){return visible;}
 static void ui_obj_hidden(lv_obj_t *o,bool hidden){o->hidden=hidden;}
 void wifi_mgr_get_link(wifi_link_t *out){*out=link;}
+static void refresh_scan_control(void){}
 #include "wifi_ui_callback.c"
 int main(void){
  link.connected=true;strlcpy(link.ssid,"primary",sizeof(link.ssid));refresh_wifi_status(NULL);
@@ -612,6 +613,144 @@ int main(void){
  visible=&screen;s_wifi_rows=0;refresh_wifi_status(NULL);assert(!tags[1].hidden);
  s_wifi_rows=2;refresh_wifi_status(NULL);assert(tags[0].hidden && tags[1].hidden);
  puts("PASS WiFi page labels follow disconnect/reconnect/switch, with hidden page and cleared-list guards");
+}
+'''
+
+# Exercise the actual page-entry and asynchronous scan code with a deferred task.
+(OUT / "wifi_scan_control.c").write_text(
+    setup[setup.index("static void refresh_scan_control("):setup.index("static void refresh_wifi_status(")],
+    encoding="utf-8")
+(OUT / "wifi_scan_under_test.c").write_text(
+    setup[setup.index("static bool scan_results_changed("):setup.index("static void on_wifi_back(")] +
+    setup[setup.index("void ui_setup_open_wifi("):setup.index("/* -------------------------------------------------- 密码输入 */")],
+    encoding="utf-8")
+(OUT / "wifi_scan_state.c").write_text(
+    setup[setup.index("#define MAX_AP"):setup.index("int ui_setup_scan_stage(")] +
+    setup[setup.index("static char s_row_ssid["):setup.index("/* ------------------------------------------------------------ 工具 */")],
+    encoding="utf-8")
+WIFI_SCAN_TEST = r'''
+#include "common.h"
+#include "wifi_mgr.h"
+#include "db.h"
+typedef struct {bool hidden,disabled,animating;const char *payload;char text[96];} lv_obj_t;
+typedef int lv_timer_t;
+typedef int lv_event_t;
+static lv_obj_t screen,other,list,tip,pool[128],refresh_btn,refresh_icon,refresh_spinner,refresh_text;
+static lv_obj_t *visible;
+static int used,created,cleaned,status_reads,anim_starts,anim_stops;
+static bool locked,allow_lock=true,create_ok=true;
+static int result=2,rssi=-50;
+static bool saved_primary=true;
+static char pending_ssid[33]="primary",expected_payload[33];
+static char message[96];
+static void (*pending_task)(void *);
+static wifi_link_t link;
+static int ui_font_18;
+#define UI_COL_TEXT 0
+#define UI_COL_MUTED 0
+#define UI_COL_GREEN 0
+#define LV_EVENT_CLICKED 0
+#define LV_ALIGN_LEFT_MID 0
+#define LV_ALIGN_RIGHT_MID 0
+#define LV_STATE_DISABLED 1
+#define WIFI_AUTH_OPEN 0
+#undef xTaskCreate
+#define xTaskCreate(fn,...) create_task(fn)
+#include "wifi_scan_state.c"
+static int create_task(void (*fn)(void *)) {
+ ++created;if(!create_ok)return 0;assert(!pending_task);pending_task=fn;return pdPASS;
+}
+static void build_wifi_screen(void){
+ s_scr_wifi=&screen;s_list_wifi=&list;s_wifi_tip=&tip;
+ s_wifi_refresh_btn=&refresh_btn;s_wifi_refresh_icon=&refresh_icon;
+ s_wifi_refresh_spinner=&refresh_spinner;s_wifi_refresh_text=&refresh_text;
+ refresh_spinner.hidden=true;strlcpy(refresh_text.text,"重新扫描",sizeof(refresh_text.text));
+}
+static void lv_screen_load(lv_obj_t *obj){visible=obj;}
+static lv_obj_t *lv_screen_active(void){return visible;}
+static void ui_obj_hidden(lv_obj_t *obj,bool hide){obj->hidden=hide;}
+static bool lv_obj_has_state(lv_obj_t *obj,int state){return obj->disabled;}
+static void lv_obj_add_state(lv_obj_t *obj,int state){obj->disabled=true;}
+static void lv_obj_remove_state(lv_obj_t *obj,int state){obj->disabled=false;}
+static void lv_label_set_text(lv_obj_t *obj,const char *text){
+ strlcpy(obj->text,text,sizeof(obj->text));
+ if(obj==s_wifi_tip)strlcpy(message,text,sizeof(message));
+}
+static void lv_spinner_set_anim_params(lv_obj_t *obj,int duration,int angle){
+ assert(duration==1000 && angle==200);obj->animating=true;++anim_starts;
+}
+static bool lv_anim_delete(lv_obj_t *obj,void *fn){obj->animating=false;++anim_stops;return true;}
+void wifi_mgr_get_link(wifi_link_t *out){++status_reads;*out=link;}
+#include "wifi_scan_control.c"
+#include "wifi_ui_callback.c"
+static bool net_saved(const char *ssid){
+ assert(!locked);if(expected_payload[0])assert(!strcmp(s_row_ssid[0],expected_payload));
+ return saved_primary && !strcmp(ssid,"primary");
+}
+int wifi_mgr_scan(wifi_ap_t *out,int max){
+ assert(!locked);if(expected_payload[0])assert(!strcmp(s_row_ssid[0],expected_payload));
+ for(int i=0;i<result;i++){strlcpy(out[i].ssid,i?"backup":pending_ssid,33);out[i].rssi=rssi;out[i].authmode=WIFI_AUTH_OPEN;}
+ return result;
+}
+static bool ui_lock(int timeout){if(!allow_lock)return false;assert(!locked);locked=true;return true;}
+static void ui_unlock(void){assert(locked);locked=false;}
+static void lv_obj_clean(lv_obj_t *obj){assert(locked);++cleaned;used=0;}
+static lv_obj_t *ui_row_card(lv_obj_t *parent,int height){assert(locked);return &pool[used++];}
+static void ui_obj_clickable(lv_obj_t *obj,bool v){}
+static void row_ap_cb(lv_event_t *e){}
+static void row_del_cb(lv_event_t *e){}
+static void lv_obj_add_event_cb(lv_obj_t *obj,void (*fn)(lv_event_t *),int event,void *payload){obj->payload=payload;}
+static lv_obj_t *ui_label(lv_obj_t *parent,const char *text,const int *font,int color){return &pool[used++];}
+static void lv_obj_align(lv_obj_t *obj,int align,int x,int y){}
+static lv_obj_t *ui_button(lv_obj_t *parent,const char *text,bool primary,void (*fn)(lv_event_t *),void *data){return &pool[used++];}
+static void lv_obj_set_size(lv_obj_t *obj,int w,int h){}
+static void vTaskDelete(void *task){}
+#include "wifi_scan_under_test.c"
+static void complete_scan(void){void (*fn)(void *)=pending_task;assert(fn);pending_task=NULL;fn(NULL);assert(!s_scanning && !locked);}
+static void check_control(bool busy){
+ assert(s_scanning==busy && refresh_btn.disabled==busy && refresh_icon.hidden==busy);
+ assert(refresh_spinner.hidden!=busy && refresh_spinner.animating==busy);
+ assert(!strcmp(refresh_text.text,busy?"扫描中…":"重新扫描"));
+}
+int main(void){
+ refresh_scan_control(); /* Before lazy screen construction. */
+ ui_setup_open_wifi();assert(created==1 && s_scanning && !cleaned);
+ check_control(true);int started=anim_starts;
+ ui_setup_open_wifi();on_rescan(NULL);assert(created==1);
+ refresh_wifi_status(NULL);assert(anim_starts==started);check_control(true);
+ complete_scan();assert(s_wifi_rows==2 && cleaned==1);
+ check_control(false);assert(anim_stops==1);
+ strlcpy(expected_payload,"primary",33);
+ int reads=status_reads;
+ link.connected=true;strlcpy(link.ssid,"primary",33);
+ ui_setup_open_wifi();assert(created==2 && cleaned==1 && status_reads>reads && !s_row_connected[0]->hidden);
+ link.connected=false;ui_setup_open_wifi();assert(s_row_connected[0]->hidden && created==2);
+ on_rescan(NULL);assert(created==2 && cleaned==1 && s_wifi_rows==2);
+ complete_scan();assert(cleaned==1); /* Identical results preserve existing rows. */
+ check_control(false);assert(s_wifi_rows==2);
+ rssi=-60;ui_setup_open_wifi();complete_scan();assert(cleaned==2 && s_wifi_aps[0].rssi==-60);
+ saved_primary=false;ui_setup_open_wifi();complete_scan();assert(cleaned==3 && !s_row_saved[0]);
+ on_rescan(NULL);assert(cleaned==3 && s_wifi_rows==2);
+ strlcpy(pending_ssid,"new-network",33);complete_scan();
+ assert(cleaned==4 && !strcmp(s_row_ssid[0],"new-network"));
+ strlcpy(expected_payload,"new-network",33);
+ result=-1;
+ on_rescan(NULL);check_control(true);complete_scan();check_control(false);assert(cleaned==4 && s_wifi_rows==2);
+ assert(!strcmp(s_row_ssid[0],expected_payload) && strstr(message,"扫描失败"));
+ int tasks=created;
+ ui_setup_open_wifi();assert(created==tasks+1 && s_wifi_rows==2 && cleaned==4);
+ result=0;expected_payload[0]=0;complete_scan();
+ assert(s_wifi_rows==0 && cleaned==5 && strstr(message,"没扫到"));
+ check_control(false);
+ tasks=created;ui_setup_open_wifi();assert(created==tasks+1);complete_scan();assert(cleaned==5);
+ result=2;allow_lock=false;on_rescan(NULL);check_control(true);visible=&other;
+ complete_scan();assert(cleaned==5 && s_wifi_rows==0);
+ refresh_wifi_status(NULL);check_control(false); /* Timer also reconciles a hidden screen after lock timeout. */
+ allow_lock=true;create_ok=false;on_rescan(NULL);check_control(false);assert(!s_scanning && !pending_task && strstr(message,"任务创建失败"));
+ create_ok=true;result=-1;
+ ui_setup_open_wifi();complete_scan();assert(s_wifi_rows==0 && cleaned==5);
+ check_control(false);assert(anim_starts==anim_stops);
+ puts("PASS WiFi scan cache: immediate reopen with background scan, unchanged rows, RSSI/saved changes, live tags, stable row payload, failures and empty results");
 }
 '''
 
@@ -722,7 +861,7 @@ for name, code, helpers in (("http", HTTP_TEST, True), ("battery", BATTERY_TEST,
                             ("power", POWER_TEST, False), ("display", DISPLAY_TEST, False),
                             ("recovery", RECOVERY_TEST, False), ("wifi", WIFI_TEST, False),
                             ("wifi_ui", WIFI_UI_TEST, False), ("transport", TRANSPORT_TEST, False),
-                            ("session", SESSION_TEST, True)):
+                            ("session", SESSION_TEST, True), ("wifi_scan", WIFI_SCAN_TEST, False)):
     src = OUT / f"{name}_test.c"
     src.write_text(code, encoding="utf-8")
     exe = OUT / (name + (".exe" if __import__("os").name == "nt" else ""))

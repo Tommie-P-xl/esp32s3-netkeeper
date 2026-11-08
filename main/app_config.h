@@ -1,6 +1,7 @@
 /*
- * 编译期默认值 —— 只在 SD 卡上还没有配置文件时用一次（首次开机播种）。
- * 之后所有配置都从 /sdcard/portal/net.cfg 读，改配置不需要重新烧录。
+ * 编译期配置：WiFi / 账号宏只在首次开机时播种。
+ * 已有 WiFi / 账号由 Flash 与 SD 配置库管理；Portal 兜底地址、轮询和电源参数
+ * 仍是编译期设置，修改后需要重新编译烧录。
  *
  * 目标板：Waveshare ESP32-S3-Touch-AMOLED-2.16
  *   ESP32-S3 N16R8 + CO5300 480x480 AMOLED + CST9217 触摸 + microSD（1-bit SDMMC）
@@ -79,11 +80,5 @@
 #define APP_CRYPTO_SELFTEST       0
 /* 启动 3 秒后统计一次界面各区域像素，确认 UI 真的画出来了（默认关） */
 #define APP_UI_SNAPSHOT_PROBE     0
-/* 启动 3 秒后把整屏显存以十六进制打到串口，用于在电脑上还原界面截图（默认关） */
-#define APP_UI_DUMP_FB            0
-/* 配合上面的抓图：自动切到各界面各截一张（默认关） */
-#define APP_UI_CAPTURE_SETUP      0
-/* 显存 dump 的降采样倍数：2 = 半分辨率(240x240，快)；1 = 原分辨率 480x480(清晰，慢) */
-#define APP_UI_DUMP_STEP          1
 /* 空闲检测调试：每 2 秒打一行 int_low / press 计数 + 当前 idle 时间（默认关） */
 #define APP_IDLE_DEBUG            0
