@@ -87,7 +87,7 @@ static void json_esc(char *dst, size_t cap, const char *src)
 /*
  * 防误改：屏幕上实时显示 6 位验证码（5 分钟换一次），网页端先验证换
  * token，再拿 token 调写接口。token 独立于验证码 —— 码换了不影响已
- * 解锁的页面（token 在浏览器里存着，7 天内一直有效）。
+ * 解锁的页面（本次开机中最多 7 天有效；重启后需要重新解锁）。
  */
 #define WEB_CODE_TTL_MS    (5 * 60 * 1000)
 #define WEB_TOKEN_TTL_MS   (7LL * 24 * 60 * 60 * 1000)
@@ -199,6 +199,18 @@ static bool authed_body(httpd_req_t *req, char *body, size_t cap)
         return false;
     }
     return true;
+}
+
+/* 只验证浏览器保存的会话，不签发 token，也不计入验证码错误次数。 */
+static esp_err_t h_session(httpd_req_t *req)
+{
+    char body[96], tok[WEB_TOKEN_LEN];
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+    if (read_body(req, body, sizeof(body)) != ESP_OK ||
+        !form_get(body, "token", tok, sizeof(tok)) || !token_check(tok)) {
+        return reply_need_auth(req);
+    }
+    return reply(req, true, "");
 }
 
 /* 用验证码换 token。连错 5 次锁 60 秒，防手贱穷举 */
@@ -597,6 +609,7 @@ esp_err_t web_start(void)
         {.uri = "/",            .method = HTTP_GET,  .handler = h_index},
         {.uri = "/api/state",   .method = HTTP_GET,  .handler = h_state},
         {.uri = "/api/auth",    .method = HTTP_POST, .handler = h_auth},
+        {.uri = "/api/session", .method = HTTP_POST, .handler = h_session},
         {.uri = "/api/wifi",    .method = HTTP_POST, .handler = h_wifi},
         {.uri = "/api/acct",    .method = HTTP_POST, .handler = h_acct},
         {.uri = "/api/use",     .method = HTTP_POST, .handler = h_use},

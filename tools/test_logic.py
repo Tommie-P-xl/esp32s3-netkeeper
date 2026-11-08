@@ -665,6 +665,55 @@ int main(void){
 }
 '''
 
+# Compile the actual request decoder, token lifetime and read-only session handler.
+web = (ROOT / "main/web.c").read_text(encoding="utf-8")
+(OUT / "session-under-test.c").write_text(
+    web[web.index("static esp_err_t read_body("):web.index("static bool form_optional(")] +
+    web[web.index("#define WEB_CODE_TTL_MS"):web.index("/* 用验证码换 token")], encoding="utf-8")
+SESSION_TEST = r'''
+#include "common.h"
+#include "http_util.h"
+static int64_t session_now_ms=100;
+#define esp_timer_get_time() (session_now_ms*1000)
+#define HTTPD_RESP_USE_STRLEN -1
+typedef struct {int content_len,offset;const char *body;} httpd_req_t;
+static bool last_ok,need_auth;
+static int random_calls;
+static unsigned esp_random(void){return ++random_calls;}
+static int httpd_req_recv(httpd_req_t *req,char *out,size_t n){
+ size_t left=req->content_len-req->offset;if(n>left)n=left;
+ memcpy(out,req->body+req->offset,n);req->offset+=(int)n;return (int)n;
+}
+static int httpd_resp_set_type(httpd_req_t *req,const char *v){return ESP_OK;}
+static int httpd_resp_set_hdr(httpd_req_t *req,const char *k,const char *v){return ESP_OK;}
+static int httpd_resp_send(httpd_req_t *req,const char *s,int len){
+ last_ok=strstr(s,"\"ok\":true")!=NULL;need_auth=strstr(s,"\"need_auth\":true")!=NULL;return ESP_OK;
+}
+static esp_err_t reply(httpd_req_t *req,bool ok,const char *msg){last_ok=ok;need_auth=false;return ESP_OK;}
+#include "session-under-test.c"
+static void check_session(const char *body,bool valid){
+ httpd_req_t req={.body=body,.content_len=(int)strlen(body)};
+ last_ok=need_auth=false;
+ assert(h_session(&req)==ESP_OK && last_ok==valid && need_auth!=valid);
+ assert(s_auth_fails==3 && s_auth_lock_until_ms==0);
+}
+int main(void){
+ s_auth_fails=3;check_session("token=stale-browser-token",false);
+ char token[WEB_TOKEN_LEN],body[96];token_issue(token,sizeof(token));
+ snprintf(body,sizeof(body),"token=%s",token);
+ const int issued=random_calls;const int64_t born=s_tokens[0].born_ms;
+ check_session(body,true);check_session(body,true);
+ assert(random_calls==issued && s_tokens[0].born_ms==born);
+ session_now_ms=born+WEB_TOKEN_TTL_MS;check_session(body,true);
+ ++session_now_ms;check_session(body,false);
+ session_now_ms=100;memset(s_tokens,0,sizeof(s_tokens));check_session(body,false);
+ check_session("token=%zz",false);check_session("",false);
+ check_session("token=123456789012345678901234567890123456",false);
+ assert(random_calls==issued);
+ puts("PASS read-only session validation: valid, stale after reboot, expired, malformed, no renewal or code failure counts");
+}
+'''
+
 gcc = shutil.which("gcc")
 if not gcc:
     raise SystemExit("gcc is required for host C regression tests")
@@ -672,7 +721,8 @@ for name, code, helpers in (("http", HTTP_TEST, True), ("battery", BATTERY_TEST,
                             ("srun", SRUN_TEST, True), ("guard", GUARD_TEST, False),
                             ("power", POWER_TEST, False), ("display", DISPLAY_TEST, False),
                             ("recovery", RECOVERY_TEST, False), ("wifi", WIFI_TEST, False),
-                            ("wifi_ui", WIFI_UI_TEST, False), ("transport", TRANSPORT_TEST, False)):
+                            ("wifi_ui", WIFI_UI_TEST, False), ("transport", TRANSPORT_TEST, False),
+                            ("session", SESSION_TEST, True)):
     src = OUT / f"{name}_test.c"
     src.write_text(code, encoding="utf-8")
     exe = OUT / (name + (".exe" if __import__("os").name == "nt" else ""))

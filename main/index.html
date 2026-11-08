@@ -54,7 +54,7 @@
              style="max-width:220px;letter-spacing:4px">
       <button class="primary" onclick="unlock()">解锁</button>
     </div>
-    <div class="hint">验证码每 5 分钟自动更换；解锁后本页面持续有效，不受换码影响。</div>
+    <div class="hint">验证码每 5 分钟自动更换；有效会话不受换码影响，板子重启后需重新解锁。</div>
   </div>
 
   <div class="card" id="status">
@@ -101,6 +101,24 @@ function setUnlocked(yes){
   document.getElementById('gate').style.display = yes ? 'none' : '';
 }
 
+function checkSession(){
+  setUnlocked(false);
+  if(!TOKEN) return Promise.resolve();
+  var token = TOKEN;
+  return fetch('/api/session', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/x-www-form-urlencoded'},
+    body: body({token: token})
+  }).then(function(r){ return r.json(); }).then(function(j){
+    /* 校验期间可能已重新解锁或主动锁定，旧响应不能覆盖新会话状态。 */
+    if(TOKEN !== token) return;
+    if(j && j.ok) setUnlocked(true);
+    else lockNow();
+  }).catch(function(){
+    /* 无法确认会话时保留验证码入口；网络失败不删除可能仍有效的凭证。 */
+  });
+}
+
 function unlock(){
   var code = document.getElementById('gate_code').value.trim();
   if(!code){ alert('请输入板子屏幕上的验证码'); return; }
@@ -138,15 +156,18 @@ function body(o){
 }
 function post(url, data){
   data = data || {};
-  data.token = TOKEN;
+  var token = TOKEN;
+  data.token = token;
   return fetch(url, {
     method: 'POST',
     headers: {'Content-Type': 'application/x-www-form-urlencoded'},
     body: body(data)
   }).then(function(r){ return r.json(); }).then(function(j){
     if(j && j.need_auth){
-      setUnlocked(false);
-      alert(j.msg || '请先输入验证码解锁');
+      if(TOKEN === token){
+        lockNow();
+        alert(j.msg || '请先输入验证码解锁');
+      }
       return j;
     }
     if(!j.ok) alert('操作失败：' + (j.msg || '未知错误'));
@@ -261,7 +282,7 @@ function lockNow(){
 }
 
 load();
-if (TOKEN) setUnlocked(true); else setUnlocked(false);
+checkSession();
 setInterval(load, 3000);
 </script>
 </body>
