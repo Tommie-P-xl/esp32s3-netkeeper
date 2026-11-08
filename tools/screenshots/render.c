@@ -149,17 +149,22 @@ static void click(lv_obj_t *parent, const char *text)
     assert(button);
     lv_obj_send_event(button, LV_EVENT_CLICKED, NULL);
 }
+static bool rectangles_overlap(const lv_area_t *a, const lv_area_t *b)
+{
+    return !(a->x2 < b->x1 || b->x2 < a->x1 || a->y2 < b->y1 || b->y2 < a->y1);
+}
 static void check_state_layout(void)
 {
     lv_obj_t *card = lv_obj_get_child(ui_screen_main(), 3);
     lv_obj_t *big = lv_obj_get_child(card, 1);
     lv_obj_t *subtitle = lv_obj_get_child(card, 2);
     lv_obj_t *battery = lv_obj_get_child(card, 3);
-    lv_obj_t *code = lv_obj_get_child(card, 4);
     lv_obj_update_layout(ui_screen_main());
-    lv_area_t right, sub;
-    lv_obj_get_coords(code, &right);
+    lv_area_t sub, card_bounds;
     lv_obj_get_coords(subtitle, &sub);
+    lv_obj_get_coords(card, &card_bounds);
+    assert(lv_obj_get_style_text_font(big, 0) == &lv_font_montserrat_40);
+    if (demo_state == NET_NO_ACCOUNT) assert(!strcmp(lv_label_get_text(big), "NO ACCOUNT"));
     for (unsigned i = 0; i < 3; ++i) {
         lv_obj_t *label = i == 0 ? big : (i == 1 ? subtitle : battery);
         lv_point_t size;
@@ -169,13 +174,21 @@ static void check_state_layout(void)
         assert(size.y <= lv_obj_get_content_height(label));
         lv_area_t area;
         lv_obj_get_coords(label, &area);
-        assert(area.x2 < right.x1);
+        assert(area.x1 >= card_bounds.x1 && area.x2 <= card_bounds.x2 && area.y2 <= card_bounds.y2);
+        for (unsigned j = 4; j <= 6; ++j) {
+            lv_area_t right;
+            lv_obj_get_coords(lv_obj_get_child(card, j), &right);
+            assert(!rectangles_overlap(&area, &right));
+        }
         if (i == 0) assert(area.y2 < sub.y1);
     }
+    lv_area_t first_row;
+    lv_obj_get_coords(lv_obj_get_child(ui_screen_main(), 4), &first_row);
+    assert(card_bounds.y2 < first_row.y1);
     lv_point_t original, actual;
     lv_text_get_size(&original, lv_label_get_text(big), &lv_font_montserrat_40, 0, 0, LV_COORD_MAX, LV_TEXT_FLAG_NONE);
     lv_text_get_size(&actual, lv_label_get_text(big), lv_obj_get_style_text_font(big, 0), 0, 0, LV_COORD_MAX, LV_TEXT_FLAG_NONE);
-    printf("State %s: original width %ld, fitted width %ld, available %ld\n",
+    printf("State %s: 40px text width %ld, rendered width %ld, available %ld\n",
            lv_label_get_text(big), (long)original.x, (long)actual.x, (long)lv_obj_get_content_width(big));
 }
 int main(int argc, char **argv)
@@ -195,12 +208,15 @@ int main(int argc, char **argv)
         demo_state = (net_state_t)state;
         advance(500);
         check_state_layout();
+        char state_name[32];
+        snprintf(state_name, sizeof(state_name), "state_%02d", state);
+        capture(argv[1], state_name);
         if (demo_state == NET_NO_ACCOUNT) capture(argv[1], "01_main_no_account");
     }
     demo_state = NET_ONLINE;
     advance(500);
     check_state_layout();
-    puts("PASS all 11 status labels fit completely without crossing the subtitle, battery or verification-code columns");
+    puts("PASS all 11 full status names use the same 40px font, fit completely and do not overlap verification widgets");
     ui_setup_open_wifi();
     complete_scan();
     advance(100);

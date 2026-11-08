@@ -15,8 +15,9 @@
 #include "web.h"
 
 static const char *TAG = "ui";
-/* 左侧状态列结束于 x=242，右侧验证码列从 x=252 开始。 */
-#define STATE_TEXT_WIDTH 172
+/* 状态独占顶行；说明/电池与验证码在下方分列。 */
+#define STATE_TEXT_WIDTH 334
+#define STATE_DETAIL_WIDTH 200
 
 typedef struct {
     lv_obj_t *scr;
@@ -77,7 +78,7 @@ static void fmt_state(net_state_t st, const char **big, const char **cn, lv_colo
     case NET_WIFI_DOWN:
         *big = "NO WIFI"; *cn = "WiFi 未连接"; *col = UI_COL_RED; break;
     case NET_NO_ACCOUNT:
-        *big = "NO ACCT"; *cn = "缺少认证账号"; *col = UI_COL_AMBER; break;
+        *big = "NO ACCOUNT"; *cn = "缺少认证账号"; *col = UI_COL_AMBER; break;
     case NET_NEED_SETUP:
         *big = "SETUP"; *cn = "请先选择 WiFi"; *col = UI_COL_AMBER; break;
     case NET_ERROR:
@@ -130,14 +131,6 @@ static void set_state_text(const char *text)
     if (strcmp(lv_label_get_text(s_ui.state_big), text) == 0) {
         return;
     }
-    lv_point_t size;
-    lv_text_get_size(&size, text, &lv_font_montserrat_40,
-                     lv_obj_get_style_text_letter_space(s_ui.state_big, 0),
-                     0, LV_COORD_MAX, LV_TEXT_FLAG_NONE);
-    /* NO ACCT、LINKING 等较宽状态改用小一档字体，完整显示且不侵入验证码列。 */
-    lv_obj_set_style_text_font(s_ui.state_big,
-                              size.x <= STATE_TEXT_WIDTH ? &lv_font_montserrat_40
-                                                        : &lv_font_montserrat_32, 0);
     lv_label_set_text(s_ui.state_big, text);
 }
 
@@ -329,7 +322,7 @@ void ui_create(lv_display_t *disp)
 
     /* ---------------- 状态卡 ---------------- */
     lv_obj_t *card = lv_obj_create(scr);
-    lv_obj_set_size(card, 428, 128);
+    lv_obj_set_size(card, 428, 152);
     lv_obj_set_pos(card, 26, 52);
     lv_obj_set_style_bg_color(card, UI_COL_CARD, 0);
     lv_obj_set_style_bg_opa(card, LV_OPA_COVER, 0);
@@ -341,7 +334,7 @@ void ui_create(lv_display_t *disp)
 
     s_ui.dot = lv_obj_create(card);
     lv_obj_set_size(s_ui.dot, 26, 26);
-    lv_obj_set_pos(s_ui.dot, 28, 51);
+    lv_obj_set_pos(s_ui.dot, 28, 20);
     lv_obj_set_style_radius(s_ui.dot, LV_RADIUS_CIRCLE, 0);
     lv_obj_set_style_bg_color(s_ui.dot, UI_COL_SKY, 0);
     lv_obj_set_style_bg_opa(s_ui.dot, LV_OPA_COVER, 0);
@@ -349,40 +342,40 @@ void ui_create(lv_display_t *disp)
     ui_obj_clickable(s_ui.dot, false);
 
     s_ui.state_big = ui_label(card, "BOOT", &lv_font_montserrat_40, UI_COL_TEXT);
-    lv_obj_set_pos(s_ui.state_big, 70, 18);
+    lv_obj_set_pos(s_ui.state_big, 70, 12);
     lv_obj_set_width(s_ui.state_big, STATE_TEXT_WIDTH);
-    lv_label_set_long_mode(s_ui.state_big, LV_LABEL_LONG_CLIP);
+    lv_label_set_long_mode(s_ui.state_big, LV_LABEL_LONG_WRAP);
 
     s_ui.state_cn = ui_label(card, "启动中", &ui_font_18, UI_COL_MUTED);
-    lv_obj_set_pos(s_ui.state_cn, 72, 78);
-    lv_obj_set_width(s_ui.state_cn, STATE_TEXT_WIDTH);
-    lv_label_set_long_mode(s_ui.state_cn, LV_LABEL_LONG_CLIP);
+    lv_obj_set_pos(s_ui.state_cn, 28, 78);
+    lv_obj_set_width(s_ui.state_cn, STATE_DETAIL_WIDTH);
+    lv_label_set_long_mode(s_ui.state_cn, LV_LABEL_LONG_WRAP);
 
     /* ---------------- 电池（卡左下） ----------------
      * 没插电池时整行隐藏；插着 USB 只显示百分比+充电状态，不估续航。
-     * 位置在状态中文下面，宽 178 px，够放「电池 100% · 充电中」。 */
+     * 独占下方左列的一行，与右列验证码留出间距。 */
     s_ui.v_bat = ui_label(card, "", &ui_font_18, UI_COL_SKY);
-    lv_obj_set_pos(s_ui.v_bat, 72, 102);
-    lv_obj_set_width(s_ui.v_bat, 180);
-    lv_label_set_long_mode(s_ui.v_bat, LV_LABEL_LONG_CLIP);
+    lv_obj_set_pos(s_ui.v_bat, 28, 110);
+    lv_obj_set_width(s_ui.v_bat, STATE_DETAIL_WIDTH);
+    lv_label_set_long_mode(s_ui.v_bat, LV_LABEL_LONG_WRAP);
     ui_obj_hidden(s_ui.v_bat, true);
 
     /* ---------------- 网页验证码（卡右侧） ---------------- */
     /* 中文必须走 ui_font_18，montserrat 没有汉字字形（会画成方框） */
     lv_obj_t *code_cap = ui_label(card, "网页验证码", &ui_font_18, UI_COL_DIM);
-    lv_obj_set_pos(code_cap, 252, 14);
+    lv_obj_set_pos(code_cap, 252, 68);
 
     s_ui.v_code = ui_label(card, "000 000", &lv_font_montserrat_28, UI_COL_AMBER);
-    lv_obj_set_pos(s_ui.v_code, 252, 40);
+    lv_obj_set_pos(s_ui.v_code, 252, 92);
 
     s_ui.v_code_ttl = ui_label(card, "剩余 05:00", &ui_font_18, UI_COL_DIM);
-    lv_obj_set_pos(s_ui.v_code_ttl, 252, 84);
+    lv_obj_set_pos(s_ui.v_code_ttl, 252, 126);
 
     /* ---------------- 信息行 ---------------- */
-    s_ui.v_ssid = make_row(scr, 192, "网络");
-    s_ui.v_ip = make_row(scr, 228, "配置网址");
-    s_ui.v_auth = make_row(scr, 264, "重新认证");
-    s_ui.v_next = make_row(scr, 300, "下次检测");
+    s_ui.v_ssid = make_row(scr, 216, "网络");
+    s_ui.v_ip = make_row(scr, 246, "配置网址");
+    s_ui.v_auth = make_row(scr, 276, "重新认证");
+    s_ui.v_next = make_row(scr, 306, "下次检测");
     s_ui.v_uptime = make_row(scr, 336, "运行时长");
     lv_obj_set_style_text_color(s_ui.v_auth, UI_COL_AMBER, 0);
 
