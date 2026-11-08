@@ -7,7 +7,7 @@ python -m pip install -r tools/screenshots/requirements.txt
 python tools/screenshots.py
 ```
 
-输出直接替换 `docs/images/` 中的十张 PNG：主页、WiFi 列表、WiFi 扫描中、
+输出直接替换 `docs/images/` 中的十一张 PNG：主页、缺少认证账号主页、WiFi 列表、WiFi 扫描中、
 WiFi 密码输入、账号管理、添加账号、网页已解锁、网页验证码入口、删除 WiFi 确认、删除账号确认。
 版本由根目录 `VERSION` 维护，截图工具不另设项目版本。
 
@@ -43,6 +43,7 @@ WiFi 扫描任务在模拟器中先挂起，完成后执行真实扫描结果处
 “已完成”和“扫描中”，并检查相同结果没有替换原列表控件。
 两种删除确认框复用真实按钮回调，同时验证取消不删除、确认后才删除、目标独立复制、
 重复确认不重复删除，以及当前联网 WiFi 的原有删除保护。
+主页遍历全部 11 种状态，按真实字体测量英文状态、中文说明和电池文字，检查完整显示和列间距。
 主机不模拟硬件触摸、QSPI、DMA、WiFi 时序或真实电池测量；屏幕实际效果仍需板上验证。
 
 网页截图打开原始 `main/index.html`；Python 仅在 `127.0.0.1` 临时提供演示 API。

@@ -17,6 +17,7 @@ static db_net_t demo_nets[] = {
 static void (*pending_scan)(void *);
 static int net_deletions, account_deletions;
 static char deleted_ssid[DB_SSID_LEN], deleted_user[DB_USER_LEN];
+static net_state_t demo_state = NET_ONLINE;
 
 int64_t esp_timer_get_time(void) { return 4550000000LL; }
 bool db_sd_present(void) { return true; }
@@ -55,9 +56,15 @@ void net_guard_switch_account(const char *ssid, const char *user) { (void)ssid; 
 void net_guard_try_ssid(const char *ssid) { (void)ssid; }
 void net_guard_get(net_status_t *out)
 {
-    *out = (net_status_t){.state = NET_ONLINE, .ssid = "ExampleWiFi", .target = "ExampleWiFi",
+    *out = (net_status_t){.state = demo_state, .ssid = "ExampleWiFi", .target = "ExampleWiFi",
         .ip = "192.0.2.10", .account = "demo-user-01", .portal = "http://portal.example.edu",
         .auth_count = 2, .boot_ms = 0, .next_check_ms = 4700000, .detail = "外网正常"};
+    if (demo_state == NET_NO_ACCOUNT) {
+        out->account[0] = '\0';
+        out->next_check_ms = 0;
+        out->auth_count = 0;
+        strlcpy(out->detail, "缺少认证账号", sizeof(out->detail));
+    }
 }
 bool power_mgr_screen_is_on(void) { return true; }
 void batt_mgr_get(batt_info_t *out)
@@ -142,6 +149,35 @@ static void click(lv_obj_t *parent, const char *text)
     assert(button);
     lv_obj_send_event(button, LV_EVENT_CLICKED, NULL);
 }
+static void check_state_layout(void)
+{
+    lv_obj_t *card = lv_obj_get_child(ui_screen_main(), 3);
+    lv_obj_t *big = lv_obj_get_child(card, 1);
+    lv_obj_t *subtitle = lv_obj_get_child(card, 2);
+    lv_obj_t *battery = lv_obj_get_child(card, 3);
+    lv_obj_t *code = lv_obj_get_child(card, 4);
+    lv_obj_update_layout(ui_screen_main());
+    lv_area_t right, sub;
+    lv_obj_get_coords(code, &right);
+    lv_obj_get_coords(subtitle, &sub);
+    for (unsigned i = 0; i < 3; ++i) {
+        lv_obj_t *label = i == 0 ? big : (i == 1 ? subtitle : battery);
+        lv_point_t size;
+        lv_text_get_size(&size, lv_label_get_text(label), lv_obj_get_style_text_font(label, 0),
+                         lv_obj_get_style_text_letter_space(label, 0), 0, LV_COORD_MAX, LV_TEXT_FLAG_NONE);
+        assert(size.x <= lv_obj_get_content_width(label));
+        assert(size.y <= lv_obj_get_content_height(label));
+        lv_area_t area;
+        lv_obj_get_coords(label, &area);
+        assert(area.x2 < right.x1);
+        if (i == 0) assert(area.y2 < sub.y1);
+    }
+    lv_point_t original, actual;
+    lv_text_get_size(&original, lv_label_get_text(big), &lv_font_montserrat_40, 0, 0, LV_COORD_MAX, LV_TEXT_FLAG_NONE);
+    lv_text_get_size(&actual, lv_label_get_text(big), lv_obj_get_style_text_font(big, 0), 0, 0, LV_COORD_MAX, LV_TEXT_FLAG_NONE);
+    printf("State %s: original width %ld, fitted width %ld, available %ld\n",
+           lv_label_get_text(big), (long)original.x, (long)actual.x, (long)lv_obj_get_content_width(big));
+}
 int main(int argc, char **argv)
 {
     assert(argc == 2);
@@ -153,7 +189,18 @@ int main(int argc, char **argv)
     lv_display_set_flush_cb(disp, flush);
     ui_create(disp);
     advance(600);
+    check_state_layout();
     capture(argv[1], "01_main");
+    for (int state = NET_BOOT; state <= NET_ERROR; ++state) {
+        demo_state = (net_state_t)state;
+        advance(500);
+        check_state_layout();
+        if (demo_state == NET_NO_ACCOUNT) capture(argv[1], "01_main_no_account");
+    }
+    demo_state = NET_ONLINE;
+    advance(500);
+    check_state_layout();
+    puts("PASS all 11 status labels fit completely without crossing the subtitle, battery or verification-code columns");
     ui_setup_open_wifi();
     complete_scan();
     advance(100);

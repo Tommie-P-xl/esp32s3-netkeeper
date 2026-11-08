@@ -15,6 +15,8 @@
 #include "web.h"
 
 static const char *TAG = "ui";
+/* 左侧状态列结束于 x=242，右侧验证码列从 x=252 开始。 */
+#define STATE_TEXT_WIDTH 172
 
 typedef struct {
     lv_obj_t *scr;
@@ -123,6 +125,22 @@ static void on_acct(lv_event_t *e)
 
 /* --------------------------------------------------------------- 刷新 */
 
+static void set_state_text(const char *text)
+{
+    if (strcmp(lv_label_get_text(s_ui.state_big), text) == 0) {
+        return;
+    }
+    lv_point_t size;
+    lv_text_get_size(&size, text, &lv_font_montserrat_40,
+                     lv_obj_get_style_text_letter_space(s_ui.state_big, 0),
+                     0, LV_COORD_MAX, LV_TEXT_FLAG_NONE);
+    /* NO ACCT、LINKING 等较宽状态改用小一档字体，完整显示且不侵入验证码列。 */
+    lv_obj_set_style_text_font(s_ui.state_big,
+                              size.x <= STATE_TEXT_WIDTH ? &lv_font_montserrat_40
+                                                        : &lv_font_montserrat_32, 0);
+    lv_label_set_text(s_ui.state_big, text);
+}
+
 static void ui_timer_cb(lv_timer_t *t)
 {
     (void)t;
@@ -156,7 +174,7 @@ static void ui_timer_cb(lv_timer_t *t)
     lv_color_t col = UI_COL_SKY;
     fmt_state(st.state, &big, &cn, &col);
 
-    lv_label_set_text(s_ui.state_big, big);
+    set_state_text(big);
     lv_label_set_text(s_ui.state_cn, cn);
     lv_obj_set_style_bg_color(s_ui.dot, col, 0);
 
@@ -332,9 +350,13 @@ void ui_create(lv_display_t *disp)
 
     s_ui.state_big = ui_label(card, "BOOT", &lv_font_montserrat_40, UI_COL_TEXT);
     lv_obj_set_pos(s_ui.state_big, 70, 18);
+    lv_obj_set_width(s_ui.state_big, STATE_TEXT_WIDTH);
+    lv_label_set_long_mode(s_ui.state_big, LV_LABEL_LONG_CLIP);
 
     s_ui.state_cn = ui_label(card, "启动中", &ui_font_18, UI_COL_MUTED);
     lv_obj_set_pos(s_ui.state_cn, 72, 78);
+    lv_obj_set_width(s_ui.state_cn, STATE_TEXT_WIDTH);
+    lv_label_set_long_mode(s_ui.state_cn, LV_LABEL_LONG_CLIP);
 
     /* ---------------- 电池（卡左下） ----------------
      * 没插电池时整行隐藏；插着 USB 只显示百分比+充电状态，不估续航。

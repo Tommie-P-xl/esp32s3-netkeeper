@@ -55,7 +55,7 @@ def device_images(lvgl_path):
     command([cmake, '--build', build, '--target', 'render', '--parallel', str(min(6, os.cpu_count() or 2))], 'build.log')
     render = build / ('render.exe' if os.name == 'nt' else 'render')
     command([render, WORK], 'render.log')
-    for name in ('01_main', '02_wifi', '02_wifi_scanning', '03_pass', '04_acct', '05_add',
+    for name in ('01_main', '01_main_no_account', '02_wifi', '02_wifi_scanning', '03_pass', '04_acct', '05_add',
                  '08_delete_wifi', '09_delete_account'):
         with Image.open(WORK / f'{name}.ppm') as img:
             assert img.size == (480, 480)
