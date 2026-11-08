@@ -47,14 +47,35 @@ static void state_set(net_state_t st, const char *fmt, ...)
     portENTER_CRITICAL(&s_lock);
     s_st.state = st;
     strlcpy(s_st.detail, buf, sizeof(s_st.detail));
+    s_st.next_check_ms = 0;
+    if (st == NET_NEED_SETUP || st == NET_WIFI_CONNECTING || st == NET_WIFI_DOWN ||
+        st == NET_NO_ACCOUNT) {
+        s_st.account[0] = '\0';
+        s_st.portal[0] = '\0';
+    }
     portEXIT_CRITICAL(&s_lock);
 }
 
 void net_guard_get(net_status_t *out)
 {
+    wifi_link_t link;
+    wifi_mgr_get_link(&link);
     portENTER_CRITICAL(&s_lock);
     *out = s_st;
     portEXIT_CRITICAL(&s_lock);
+    /* 页面和网页统一使用驱动事件维护的当前链路，绝不展示上轮的地址。 */
+    strlcpy(out->ssid, link.ssid, sizeof(out->ssid));
+    strlcpy(out->ip, link.ip, sizeof(out->ip));
+    if (!link.connected) {
+        out->next_check_ms = 0;
+        out->account[0] = '\0';
+        out->portal[0] = '\0';
+        if (out->state != NET_BOOT && out->state != NET_NEED_SETUP &&
+            out->state != NET_WIFI_CONNECTING && out->state != NET_WIFI_DOWN) {
+            out->state = NET_WIFI_DOWN;
+            strlcpy(out->detail, "WiFi 断开，正在重试", sizeof(out->detail));
+        }
+    }
 }
 
 void net_guard_trigger(void)
@@ -194,24 +215,27 @@ static bool run_cycle(const char *ssid, const char *user, const char *pass, bool
 
 static bool ensure_connected(const char *target, const char *pass)
 {
-    char cur[33] = "";
-    wifi_mgr_ssid(cur, sizeof(cur));
+    wifi_link_t link;
+    wifi_mgr_get_link(&link);
 
-    const bool need = !wifi_mgr_connected() || strcmp(s_last_target, target) != 0;
+    const bool need = !link.connected || strcmp(link.ssid, target) != 0;
 
     if (need) {
         state_set(NET_WIFI_CONNECTING, "连接 %s", target);
-        wifi_mgr_connect(target, pass);
+        const esp_err_t err = wifi_mgr_connect(target, pass);
         strlcpy(s_last_target, target, sizeof(s_last_target));
 
-        if (!wifi_mgr_wait_ip(APP_WIFI_CONNECT_TIMEOUT_MS)) {
+        if (err != ESP_OK || !wifi_mgr_wait_ip(APP_WIFI_CONNECT_TIMEOUT_MS)) {
             state_set(NET_WIFI_DOWN, "连不上 %s", target);
             return false;
         }
     }
 
-    wifi_mgr_ip(s_st.ip, sizeof(s_st.ip));
-    wifi_mgr_ssid(s_st.ssid, sizeof(s_st.ssid));
+    wifi_mgr_get_link(&link);
+    if (!link.connected || strcmp(link.ssid, target) != 0) {
+        state_set(NET_WIFI_DOWN, "连不上 %s", target);
+        return false;
+    }
     return true;
 }
 
@@ -244,10 +268,8 @@ static void net_task(void *arg)
             }
             db_read_end();
 
-            state_set(NET_WIFI_CONNECTING, "尝试连接 %s", try_ssid);
-            wifi_mgr_connect(try_ssid, pass);
-
-            if (wifi_mgr_wait_ip(APP_WIFI_CONNECT_TIMEOUT_MS)) {
+            /* 与常规重连共用校验，旧连接迟到的 GOT_IP 不能使新目标试连成功。 */
+            if (ensure_connected(try_ssid, pass)) {
                 /* 连上了才把守护目标切过去，失败不影响原来能用的网络 */
                 db_set_active_ssid(try_ssid);
                 db_set_last_ok(try_ssid);
@@ -311,9 +333,8 @@ static void net_task(void *arg)
                     state_set(NET_WIFI_DOWN, "连不上 %s，回退 %s", target, alt);
                     db_set_active_ssid(alt);
                 } else {
-                    ESP_LOGW(TAG, "no fallback network, clear target");
-                    state_set(NET_NEED_SETUP, "网络都连不上，请重新选择");
-                    db_set_active_ssid("");
+                    ESP_LOGW(TAG, "no fallback network, keep [%s] and retry", target);
+                    state_set(NET_WIFI_DOWN, "连不上 %s，继续重试", target);
                 }
             }
             idle_wait(APP_WIFI_RETRY_MS);

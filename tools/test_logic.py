@@ -76,9 +76,9 @@ i2c_master_bus_handle_t bsp_i2c_get_handle(void);
 void esp_sleep_disable_wakeup_source(int);
 void esp_deep_sleep_start(void);
 '''
-for name in ("esp_err.h", "esp_log.h", "esp_timer.h", "nvs.h", "esp_wifi.h",
+for name in ("esp_err.h", "esp_log.h", "esp_timer.h", "nvs.h", "esp_wifi.h", "esp_event.h", "esp_netif.h",
              "lvgl.h", "esp_sleep.h", "driver/i2c_master.h", "bsp/esp-bsp.h",
-             "freertos/FreeRTOS.h", "freertos/task.h", "freertos/semphr.h"):
+             "freertos/FreeRTOS.h", "freertos/task.h", "freertos/semphr.h", "freertos/event_groups.h"):
     p = OUT / name
     p.parent.mkdir(parents=True, exist_ok=True)
     p.write_text('#include "common.h"\n', encoding="utf-8")
@@ -208,6 +208,7 @@ GUARD_TEST = r'''
 static int probe_count, logout_count,login_count,query_error;
 static bool logout_ok=true;
 static char online_user[64]="old";
+void wifi_mgr_get_link(wifi_link_t *out){*out=(wifi_link_t){.connected=true};}
 probe_result_t srun_probe(portal_info_t*pi){memset(pi,0,sizeof(*pi));strlcpy(pi->portal_base,"http://portal.test",64);probe_count++;return PROBE_ONLINE;}
 esp_err_t srun_online_user(const portal_info_t*pi,char*u,size_t n){strlcpy(u,online_user,n);return query_error;}
 bool srun_logout(const portal_info_t*pi,const char*u,char*d,size_t n){logout_count++;return logout_ok;}
@@ -358,12 +359,212 @@ int main(void){
 for name in ("esp_heap_caps.h", "esp_lv_adapter.h", "esp_lv_adapter_display.h"):
     (OUT / name).write_text('#include "common.h"\n', encoding="utf-8")
 
+RECOVERY_TEST = r'''
+#include "common.h"
+static int64_t clock_us;
+static void advance_time(unsigned ms);
+#undef vTaskDelay
+#define vTaskDelay(ms) advance_time(ms)
+#define esp_timer_get_time() clock_us
+#include "net_guard.c"
+static jmp_buf finish;
+static char active[33], attempted[33], last_ok[33];
+static db_net_t saved;
+static wifi_link_t link;
+static int connects, waits, clears, changes, recover_after, connect_error;
+static bool wrong_trial_ip;
+static void advance_time(unsigned ms) {
+ clock_us+=(int64_t)ms*1000;
+ if(s_st.state==NET_NO_ACCOUNT || s_st.state==NET_NEED_SETUP)longjmp(finish,1);
+ assert(clock_us<180000000); /* A stuck setup/retry loop must fail, not hang. */
+}
+void db_read_begin(void){}
+void db_read_end(void){}
+const db_net_t *db_find(const char *ssid){return &saved;}
+void db_active_ssid(char *out,size_t n){strlcpy(out,active,n);}
+esp_err_t db_set_active_ssid(const char *ssid){++changes;if(!ssid[0])++clears;strlcpy(active,ssid,sizeof(active));return ESP_OK;}
+esp_err_t db_set_last_ok(const char *ssid){strlcpy(last_ok,ssid,sizeof(last_ok));return ESP_OK;}
+void db_last_ok(char *out,size_t n){strlcpy(out,last_ok,n);}
+bool db_other_ssid(const char *avoid,char *out,size_t n){out[0]=0;return false;}
+bool db_current_acct(const char *ssid,char *u,size_t un,char *p,size_t pn){return false;}
+void wifi_mgr_get_link(wifi_link_t *out){*out=link;}
+bool wifi_mgr_connected(void){return link.connected;}
+esp_err_t wifi_mgr_connect(const char *ssid,const char *pass){
+ ++connects;strlcpy(attempted,ssid,sizeof(attempted));memset(&link,0,sizeof(link));return connect_error;
+}
+bool wifi_mgr_wait_ip(uint32_t timeout_ms){
+ ++waits;
+ if(connects<recover_after){clock_us+=(int64_t)timeout_ms*1000;return false;}
+ link.connected=true;strlcpy(link.ssid,wrong_trial_ip?"primary":attempted,sizeof(link.ssid));strlcpy(link.ip,"192.168.5.5",sizeof(link.ip));return true;
+}
+void wifi_mgr_disconnect(void){memset(&link,0,sizeof(link));}
+probe_result_t srun_probe(portal_info_t *pi){assert(false);return PROBE_NO_LINK;}
+esp_err_t srun_online_user(const portal_info_t *pi,char *u,size_t n){return ESP_FAIL;}
+bool srun_logout(const portal_info_t *pi,const char *u,char *d,size_t n){return false;}
+login_result_t srun_login(const portal_info_t *pi,const char *u,const char *p,const char *domain,char *d,size_t n){return LOGIN_FAIL;}
+static void reset(void){
+ memset(&s_st,0,sizeof(s_st));memset(&link,0,sizeof(link));
+ strlcpy(active,"primary",sizeof(active));strlcpy(last_ok,"primary",sizeof(last_ok));
+ s_last_target[0]=s_try_ssid[0]=0;
+ clock_us=0;connects=waits=clears=changes=connect_error=0;recover_after=3;wrong_trial_ip=false;
+}
+static void run(void){if(!setjmp(finish))net_task(NULL);}
+int main(void){
+ reset();run();
+ assert(connects==3 && waits==3 && !clears && !changes && !strcmp(active,"primary"));
+ assert(s_st.state==NET_NO_ACCOUNT && !strcmp(link.ssid,"primary"));
+ reset();strlcpy(last_ok,"backup",sizeof(last_ok));run();
+ assert(connects==3 && changes==1 && !clears && !strcmp(active,"backup") && !strcmp(link.ssid,"backup"));
+ reset();active[0]=0;run();assert(s_st.state==NET_NEED_SETUP && !connects);
+ reset();strlcpy(s_try_ssid,"bad-trial",sizeof(s_try_ssid));recover_after=2;run();
+ assert(connects==2 && !changes && !strcmp(active,"primary") && !strcmp(link.ssid,"primary"));
+ reset();strlcpy(s_try_ssid,"bad-trial",sizeof(s_try_ssid));recover_after=1;wrong_trial_ip=true;run();
+ assert(connects==1 && !changes && !strcmp(active,"primary")); /* A late old-network IP cannot select the trial. */
+ reset();s_st.state=NET_ONLINE;s_st.next_check_ms=90000;
+ strlcpy(s_st.ip,"192.168.5.99",sizeof(s_st.ip));strlcpy(s_st.ssid,"old",sizeof(s_st.ssid));
+ strlcpy(s_st.account,"old-account",sizeof(s_st.account));strlcpy(s_st.portal,"old-portal",sizeof(s_st.portal));
+ net_status_t out;net_guard_get(&out);
+ assert(out.state==NET_WIFI_DOWN && !out.ip[0] && !out.ssid[0] && !out.account[0] && !out.portal[0] && !out.next_check_ms);
+ link.connected=true;strlcpy(link.ssid,"primary",sizeof(link.ssid));strlcpy(link.ip,"192.168.5.5",sizeof(link.ip));
+ assert(ensure_connected("primary","password") && !connects); /* Stale last_target cannot force a reconnect. */
+ net_guard_get(&out);assert(!strcmp(out.ip,link.ip) && !strcmp(out.ssid,link.ssid));
+ recover_after=1;assert(ensure_connected("other","password") && connects==1 && !strcmp(link.ssid,"other"));
+ connect_error=ESP_FAIL;assert(!ensure_connected("primary","password") && waits==1);
+ s_st.next_check_ms=90000;state_set(NET_NO_ACCOUNT,"no account");
+ assert(!s_st.next_check_ms && !s_st.account[0] && !s_st.portal[0]);
+ puts("PASS repeated WiFi timeouts recover automatically, fallback, setup, failed trial, real SSID/IP and driver errors");
+}
+'''
+
+WIFI_TEST = r'''
+#include "common.h"
+typedef int esp_event_base_t;
+#define WIFI_EVENT 1
+#define IP_EVENT 2
+#define WIFI_EVENT_STA_START 1
+#define WIFI_EVENT_STA_CONNECTED 2
+#define WIFI_EVENT_STA_DISCONNECTED 3
+#define IP_EVENT_STA_GOT_IP 1
+#define IP_EVENT_STA_LOST_IP 2
+#define ESP_EVENT_ANY_ID -1
+#define BIT0 1
+#define pdFALSE 0
+#define WIFI_AUTH_OPEN 0
+#define WIFI_AUTH_WPA2_PSK 3
+#define WPA3_SAE_PWE_BOTH 0
+#define WIFI_IF_STA 0
+#define WIFI_MODE_STA 1
+#define WIFI_PS_MIN_MODEM 0
+#define WIFI_SCAN_TYPE_ACTIVE 0
+#define ESP_ERROR_CHECK(x) assert((x)==ESP_OK)
+typedef struct {uint8_t ssid[32];uint8_t ssid_len;} wifi_event_sta_connected_t;
+typedef struct {int reason;} wifi_event_sta_disconnected_t;
+typedef struct {uint8_t ssid[32];int8_t rssi;uint8_t authmode;} wifi_ap_record_t;
+typedef struct {struct {uint8_t ssid[32],password[64];struct {int authmode;} threshold;int sae_pwe_h2e;struct {bool capable,required;} pmf_cfg;} sta;} wifi_config_t;
+typedef struct {void *ssid,*bssid;int channel;bool show_hidden;int scan_type;} wifi_scan_config_t;
+typedef struct {int unused;} wifi_init_config_t;
+#define WIFI_INIT_CONFIG_DEFAULT() ((wifi_init_config_t){0})
+typedef int esp_netif_t;
+typedef struct {struct {struct {unsigned bytes[4];} ip;} ip_info;} ip_event_got_ip_t;
+#define IPSTR "%u.%u.%u.%u"
+#define IP2STR(p) (p)->bytes[0],(p)->bytes[1],(p)->bytes[2],(p)->bytes[3]
+typedef unsigned EventBits_t;
+typedef unsigned *EventGroupHandle_t;
+static unsigned bits;
+static int registered_ip=-2,sntp,ap_error;
+static bool driver_busy;
+static wifi_config_t driver_config;
+static wifi_ap_record_t ap;
+static EventGroupHandle_t xEventGroupCreate(void){return &bits;}
+static unsigned xEventGroupClearBits(EventGroupHandle_t e,unsigned b){*e&=~b;return *e;}
+static unsigned xEventGroupSetBits(EventGroupHandle_t e,unsigned b){*e|=b;return *e;}
+static unsigned xEventGroupWaitBits(EventGroupHandle_t e,unsigned b,bool clear,bool all,unsigned ms){return *e;}
+static esp_netif_t *esp_netif_create_default_wifi_sta(void){static int n;return &n;}
+static esp_err_t esp_wifi_init(const wifi_init_config_t *ic){return ESP_OK;}
+static esp_err_t esp_event_handler_instance_register(int base,int id,void (*fn)(void *,int,int32_t,void *),void *a,void *b){if(base==IP_EVENT)registered_ip=id;return ESP_OK;}
+static esp_err_t esp_wifi_set_mode(int m){return ESP_OK;}
+static esp_err_t esp_wifi_start(void){return ESP_OK;}
+static esp_err_t esp_wifi_set_ps(int ps){return ESP_OK;}
+static esp_err_t esp_wifi_set_config(int iface,const wifi_config_t *c){if(driver_busy)return ESP_ERR_INVALID_STATE;driver_config=*c;return ESP_OK;}
+static esp_err_t esp_wifi_get_config(int iface,wifi_config_t *c){*c=driver_config;return ESP_OK;}
+static esp_err_t esp_wifi_disconnect(void){driver_busy=false;return ESP_OK;}
+static esp_err_t esp_wifi_connect(void){driver_busy=true;return ESP_OK;}
+static esp_err_t esp_wifi_sta_get_ap_info(wifi_ap_record_t *out){*out=ap;return ap_error;}
+static esp_err_t esp_wifi_scan_start(const wifi_scan_config_t *cfg,bool block){return ESP_OK;}
+static esp_err_t esp_wifi_scan_get_ap_num(uint16_t *n){*n=0;return ESP_OK;}
+static esp_err_t esp_wifi_scan_get_ap_records(uint16_t *n,wifi_ap_record_t *r){return ESP_OK;}
+void sys_time_sntp_start(void){++sntp;}
+#include "wifi_mgr.c"
+static void got_ip(void){
+ ip_event_got_ip_t e={.ip_info.ip.bytes={192,168,5,5}};
+ event_handler(NULL,IP_EVENT,IP_EVENT_STA_GOT_IP,&e);
+}
+int main(void){
+ assert(wifi_mgr_init()==ESP_OK && registered_ip==ESP_EVENT_ANY_ID);
+ wifi_event_sta_connected_t e={.ssid="primary",.ssid_len=7};
+ event_handler(NULL,WIFI_EVENT,WIFI_EVENT_STA_CONNECTED,&e);
+ wifi_link_t link;wifi_mgr_get_link(&link);assert(!link.connected && !link.ssid[0] && !link.ip[0]);
+ got_ip();wifi_mgr_get_link(&link);assert(link.connected && !strcmp(link.ssid,"primary") && !strcmp(link.ip,"192.168.5.5") && wifi_mgr_wait_ip(1));
+ strlcpy((char *)ap.ssid,"primary",32);strlcpy((char *)driver_config.sta.ssid,"primary",32);strlcpy((char *)driver_config.sta.password,"password",64);
+ char ssid[33],pass[65];assert(wifi_mgr_current_credentials(ssid,sizeof(ssid),pass,sizeof(pass)) && !strcmp(pass,"password"));
+ event_handler(NULL,IP_EVENT,IP_EVENT_STA_LOST_IP,NULL);
+ wifi_mgr_get_link(&link);assert(!link.connected && !link.ssid[0] && !link.ip[0] && !bits && !wifi_mgr_wait_ip(1));
+ assert(!wifi_mgr_current_credentials(ssid,sizeof(ssid),pass,sizeof(pass)));
+ got_ip();wifi_mgr_get_link(&link);assert(link.connected && !strcmp(link.ssid,"primary"));
+ wifi_event_sta_disconnected_t d={.reason=200};
+ event_handler(NULL,WIFI_EVENT,WIFI_EVENT_STA_DISCONNECTED,&d);
+ wifi_mgr_get_link(&link);assert(!link.connected && !link.ssid[0] && !link.ip[0] && !s_ssid[0] && !bits);
+ wifi_mgr_ssid(ssid,sizeof(ssid));assert(!ssid[0]);wifi_mgr_ip(ssid,sizeof(ssid));assert(!ssid[0]);
+ event_handler(NULL,WIFI_EVENT,WIFI_EVENT_STA_CONNECTED,&e);got_ip();wifi_mgr_disconnect();
+ wifi_mgr_get_link(&link);assert(!link.connected && !link.ip[0] && !link.ssid[0] && !bits);
+ event_handler(NULL,WIFI_EVENT,WIFI_EVENT_STA_CONNECTED,&e);got_ip();
+ driver_busy=true; /* A timed-out driver attempt must be stopped before set_config. */
+ assert(wifi_mgr_connect("other","password")==ESP_OK);
+ wifi_mgr_get_link(&link);assert(!link.connected && !link.ip[0] && !link.ssid[0] && !bits);
+ puts("PASS actual WiFi events: association, IP acquisition/loss/recovery, disconnect, explicit disconnect and network switch");
+}
+'''
+
+# Exercise the exact LVGL refresh callback without linking the rest of LVGL.
+setup = (ROOT / "main/ui_setup.c").read_text(encoding="utf-8")
+(OUT / "wifi_ui_callback.c").write_text(
+    setup[setup.index("static void refresh_wifi_status("):setup.index("static void row_ap_cb(")], encoding="utf-8")
+WIFI_UI_TEST = r'''
+#include "common.h"
+#include "wifi_mgr.h"
+typedef struct {bool hidden;} lv_obj_t;
+typedef int lv_timer_t;
+static lv_obj_t screen,other,tags[2];
+static lv_obj_t *s_scr_wifi=&screen,*visible=&screen;
+static lv_obj_t *s_row_connected[]={&tags[0],&tags[1]};
+static char s_row_ssid[][33]={"primary","backup"};
+static int s_wifi_rows=2;
+static wifi_link_t link;
+static lv_obj_t *lv_screen_active(void){return visible;}
+static void ui_obj_hidden(lv_obj_t *o,bool hidden){o->hidden=hidden;}
+void wifi_mgr_get_link(wifi_link_t *out){*out=link;}
+#include "wifi_ui_callback.c"
+int main(void){
+ link.connected=true;strlcpy(link.ssid,"primary",sizeof(link.ssid));refresh_wifi_status(NULL);
+ assert(!tags[0].hidden && tags[1].hidden);
+ link.connected=false;refresh_wifi_status(NULL);assert(tags[0].hidden && tags[1].hidden);
+ link.connected=true;strlcpy(link.ssid,"backup",sizeof(link.ssid));refresh_wifi_status(NULL);
+ assert(tags[0].hidden && !tags[1].hidden);
+ visible=&other;link.connected=false;refresh_wifi_status(NULL);assert(!tags[1].hidden);
+ visible=&screen;s_wifi_rows=0;refresh_wifi_status(NULL);assert(!tags[1].hidden);
+ s_wifi_rows=2;refresh_wifi_status(NULL);assert(tags[0].hidden && tags[1].hidden);
+ puts("PASS WiFi page labels follow disconnect/reconnect/switch, with hidden page and cleared-list guards");
+}
+'''
+
 gcc = shutil.which("gcc")
 if not gcc:
     raise SystemExit("gcc is required for host C regression tests")
 for name, code, helpers in (("http", HTTP_TEST, True), ("battery", BATTERY_TEST, False),
                             ("srun", SRUN_TEST, True), ("guard", GUARD_TEST, False),
-                            ("power", POWER_TEST, False), ("display", DISPLAY_TEST, False)):
+                            ("power", POWER_TEST, False), ("display", DISPLAY_TEST, False),
+                            ("recovery", RECOVERY_TEST, False), ("wifi", WIFI_TEST, False),
+                            ("wifi_ui", WIFI_UI_TEST, False)):
     src = OUT / f"{name}_test.c"
     src.write_text(code, encoding="utf-8")
     exe = OUT / (name + (".exe" if __import__("os").name == "nt" else ""))

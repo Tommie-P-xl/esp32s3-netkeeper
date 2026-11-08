@@ -54,6 +54,8 @@ static void build_add_screen(void);
 
 /* 行回调只带指针，所以载荷必须活得比控件久 */
 static char s_row_ssid[MAX_ROWS][DB_SSID_LEN];
+static lv_obj_t *s_row_connected[MAX_ROWS];
+static int s_wifi_rows;
 static char s_row_user[MAX_ROWS][DB_USER_LEN];
 static wifi_ap_t s_aps[MAX_AP];
 
@@ -73,6 +75,21 @@ static bool net_saved(const char *ssid)
 }
 
 /* -------------------------------------------------- WiFi 列表 */
+
+static void refresh_wifi_status(lv_timer_t *timer)
+{
+    (void)timer;
+    if (s_scr_wifi == NULL || lv_screen_active() != s_scr_wifi) {
+        return;
+    }
+    /* 只读短临界区内的连接快照，不在显示锁里访问配置库。 */
+    wifi_link_t link;
+    wifi_mgr_get_link(&link);
+    for (int i = 0; i < s_wifi_rows; i++) {
+        ui_obj_hidden(s_row_connected[i],
+                      !link.connected || strcmp(s_row_ssid[i], link.ssid) != 0);
+    }
+}
 
 static void row_ap_cb(lv_event_t *e)
 {
@@ -135,10 +152,6 @@ static void scan_task(void *arg)
     /* 锁外预取：数据库查询 + RSSI 文案 */
     bool saved[MAX_ROWS];
     char sub[MAX_ROWS][72];
-    char cur_ssid[33] = "";
-
-    wifi_mgr_ssid(cur_ssid, sizeof(cur_ssid));
-
     const int rows = (n > 0) ? ((n < MAX_ROWS) ? n : MAX_ROWS) : 0;
     for (int i = 0; i < rows; i++) {
         strlcpy(s_row_ssid[i], s_aps[i].ssid, sizeof(s_row_ssid[i]));
@@ -151,6 +164,7 @@ static void scan_task(void *arg)
     if (ui_lock(2000)) {
         s_scan_stage = 3;
         if (s_list_wifi != NULL) {
+            s_wifi_rows = 0;
             lv_obj_clean(s_list_wifi);
             s_scan_stage = 4;
 
@@ -172,10 +186,9 @@ static void scan_task(void *arg)
                     lv_obj_t *info = ui_label(row, sub[i], &ui_font_18, UI_COL_MUTED);
                     lv_obj_align(info, LV_ALIGN_LEFT_MID, 4, 12);
 
-                    if (strcmp(s_row_ssid[i], cur_ssid) == 0) {
-                        lv_obj_t *tag = ui_label(row, "已连接", &ui_font_18, UI_COL_GREEN);
-                        lv_obj_align(tag, LV_ALIGN_RIGHT_MID, -84, 0);
-                    }
+                    s_row_connected[i] = ui_label(row, "已连接", &ui_font_18, UI_COL_GREEN);
+                    lv_obj_align(s_row_connected[i], LV_ALIGN_RIGHT_MID, -84, 0);
+                    ui_obj_hidden(s_row_connected[i], true);
 
                     /* 已保存的网络给一个删除入口（需求：板上可直接删 WiFi）。
                      * 按钮可点，点击不会冒泡到整行，所以不会误触发连接。 */
@@ -185,6 +198,8 @@ static void scan_task(void *arg)
                         lv_obj_align(del, LV_ALIGN_RIGHT_MID, -4, 0);
                     }
                 }
+                s_wifi_rows = rows;
+                refresh_wifi_status(NULL);
             }
             s_scan_stage = 5;
         }
@@ -204,6 +219,7 @@ static void start_scan(void)
     }
     s_scanning = true;
     lv_label_set_text(s_wifi_tip, "扫描中…");
+    s_wifi_rows = 0;
     lv_obj_clean(s_list_wifi);
 
     if (xTaskCreate(scan_task, "wifi_scan", 4096, NULL, 4, NULL) != pdPASS) {
@@ -262,6 +278,7 @@ static void build_wifi_screen(void)
     lv_obj_t *b2 = ui_button(s_scr_wifi, "账户管理", true, on_acct_from_wifi, NULL);
     lv_obj_set_pos(b2, 254, 406);
     lv_obj_set_size(b2, 200, 48);
+    lv_timer_create(refresh_wifi_status, 500, NULL);
 }
 
 void ui_setup_open_wifi(void)

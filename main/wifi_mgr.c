@@ -21,7 +21,31 @@ static EventGroupHandle_t s_evt;
 static esp_netif_t *s_netif;
 static char s_ip[16];
 static char s_ssid[33];
-static volatile bool s_connected;
+static bool s_connected;
+static portMUX_TYPE s_lock = portMUX_INITIALIZER_UNLOCKED;
+
+static void clear_link(bool clear_ssid)
+{
+    portENTER_CRITICAL(&s_lock);
+    s_connected = false;
+    s_ip[0] = '\0';
+    if (clear_ssid) {
+        s_ssid[0] = '\0';
+    }
+    portEXIT_CRITICAL(&s_lock);
+    xEventGroupClearBits(s_evt, BIT_IP);
+}
+
+void wifi_mgr_get_link(wifi_link_t *out)
+{
+    portENTER_CRITICAL(&s_lock);
+    *out = (wifi_link_t){.connected = s_connected};
+    if (s_connected) {
+        strlcpy(out->ssid, s_ssid, sizeof(out->ssid));
+        strlcpy(out->ip, s_ip, sizeof(out->ip));
+    }
+    portEXIT_CRITICAL(&s_lock);
+}
 
 static void event_handler(void *arg, esp_event_base_t base, int32_t id, void *data)
 {
@@ -32,19 +56,31 @@ static void event_handler(void *arg, esp_event_base_t base, int32_t id, void *da
         char ssid[33] = {0};
         const size_t n = (e->ssid_len < sizeof(ssid) - 1) ? e->ssid_len : sizeof(ssid) - 1;
         memcpy(ssid, e->ssid, n);
+        portENTER_CRITICAL(&s_lock);
         strlcpy(s_ssid, ssid, sizeof(s_ssid));
-        ESP_LOGI(TAG, "associated with [%s]", s_ssid);
+        portEXIT_CRITICAL(&s_lock);
+        ESP_LOGI(TAG, "associated with [%s]", ssid);
     } else if (base == WIFI_EVENT && id == WIFI_EVENT_STA_DISCONNECTED) {
         const wifi_event_sta_disconnected_t *e = (const wifi_event_sta_disconnected_t *)data;
-        s_connected = false;
-        s_ip[0] = '\0';
-        xEventGroupClearBits(s_evt, BIT_IP);
-        ESP_LOGW(TAG, "disconnected from [%s], reason=%d", s_ssid, e ? e->reason : -1);
+        char ssid[33];
+        portENTER_CRITICAL(&s_lock);
+        strlcpy(ssid, s_ssid, sizeof(ssid));
+        portEXIT_CRITICAL(&s_lock);
+        clear_link(true);
+        ESP_LOGW(TAG, "disconnected from [%s], reason=%d", ssid, e ? e->reason : -1);
+    } else if (base == IP_EVENT && id == IP_EVENT_STA_LOST_IP) {
+        /* 关联可能仍在；保留内部 SSID，DHCP 恢复后 GOT_IP 可再次发布。 */
+        clear_link(false);
+        ESP_LOGW(TAG, "station lost IP, waiting for reconnect or DHCP recovery");
     } else if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP) {
         const ip_event_got_ip_t *e = (const ip_event_got_ip_t *)data;
+        portENTER_CRITICAL(&s_lock);
         snprintf(s_ip, sizeof(s_ip), IPSTR, IP2STR(&e->ip_info.ip));
         s_connected = true;
-        ESP_LOGI(TAG, "got ip %s (ssid [%s])", s_ip, s_ssid);
+        portEXIT_CRITICAL(&s_lock);
+        wifi_link_t link;
+        wifi_mgr_get_link(&link);
+        ESP_LOGI(TAG, "got ip %s (ssid [%s])", link.ip, link.ssid);
         xEventGroupSetBits(s_evt, BIT_IP);
         /* 联网成功就校一次时（幂等，换网/重连后会重新校） */
         sys_time_sntp_start();
@@ -66,7 +102,7 @@ esp_err_t wifi_mgr_init(void)
     ESP_ERROR_CHECK(esp_event_handler_instance_register(
         WIFI_EVENT, ESP_EVENT_ANY_ID, &event_handler, NULL, NULL));
     ESP_ERROR_CHECK(esp_event_handler_instance_register(
-        IP_EVENT, IP_EVENT_STA_GOT_IP, &event_handler, NULL, NULL));
+        IP_EVENT, ESP_EVENT_ANY_ID, &event_handler, NULL, NULL));
 
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
     ESP_ERROR_CHECK(esp_wifi_start());
@@ -99,8 +135,8 @@ esp_err_t wifi_mgr_connect(const char *ssid, const char *pass)
     wc.sta.pmf_cfg.capable = true;
     wc.sta.pmf_cfg.required = false;
 
-    xEventGroupClearBits(s_evt, BIT_IP);
-    s_connected = false;
+    /* 先停止仍在进行的旧尝试；连接中 set_config 会返回 ESP_ERR_WIFI_STATE。 */
+    wifi_mgr_disconnect();
 
     esp_err_t err = esp_wifi_set_config(WIFI_IF_STA, &wc);
     if (err != ESP_OK) {
@@ -108,7 +144,6 @@ esp_err_t wifi_mgr_connect(const char *ssid, const char *pass)
         return err;
     }
 
-    esp_wifi_disconnect(); /* 换网时先断，避免旧连接卡住重连计数 */
     err = esp_wifi_connect();
     ESP_LOGI(TAG, "connect [%s] (%s) -> %s", ssid,
              wc.sta.password[0] ? "wpa2/3" : "open", esp_err_to_name(err));
@@ -118,46 +153,48 @@ esp_err_t wifi_mgr_connect(const char *ssid, const char *pass)
 void wifi_mgr_disconnect(void)
 {
     esp_wifi_disconnect();
-    s_connected = false;
-    xEventGroupClearBits(s_evt, BIT_IP);
+    clear_link(true);
 }
 
 void wifi_mgr_reconnect(void)
 {
-    if (s_ssid[0] != '\0') {
-        ESP_LOGI(TAG, "reconnect to [%s]", s_ssid);
-    }
     esp_wifi_connect();
 }
 
 bool wifi_mgr_connected(void)
 {
-    return s_connected;
+    wifi_link_t link;
+    wifi_mgr_get_link(&link);
+    return link.connected;
 }
 
 bool wifi_mgr_wait_ip(uint32_t timeout_ms)
 {
     const EventBits_t bits =
         xEventGroupWaitBits(s_evt, BIT_IP, pdFALSE, pdFALSE, pdMS_TO_TICKS(timeout_ms));
-    return (bits & BIT_IP) != 0;
+    return (bits & BIT_IP) != 0 && wifi_mgr_connected();
 }
 
 void wifi_mgr_ip(char *out, size_t cap)
 {
-    strlcpy(out, s_ip, cap);
+    wifi_link_t link;
+    wifi_mgr_get_link(&link);
+    strlcpy(out, link.ip, cap);
 }
 
 void wifi_mgr_ssid(char *out, size_t cap)
 {
-    strlcpy(out, s_ssid, cap);
+    wifi_link_t link;
+    wifi_mgr_get_link(&link);
+    strlcpy(out, link.ssid, cap);
 }
 
 bool wifi_mgr_current_credentials(char *ssid, size_t scap, char *pass, size_t pcap)
 {
     wifi_ap_record_t ap;
     wifi_config_t cfg;
-    if (!s_connected || esp_wifi_sta_get_ap_info(&ap) != ESP_OK ||
-        esp_wifi_get_config(WIFI_IF_STA, &cfg) != ESP_OK || !s_connected ||
+    if (!wifi_mgr_connected() || esp_wifi_sta_get_ap_info(&ap) != ESP_OK ||
+        esp_wifi_get_config(WIFI_IF_STA, &cfg) != ESP_OK || !wifi_mgr_connected() ||
         strncmp((const char *)ap.ssid, (const char *)cfg.sta.ssid, 32) != 0) {
         return false;
     }
@@ -255,8 +292,10 @@ int wifi_mgr_scan(wifi_ap_t *out, int max)
     }
 
     /* 连着的那个排最前，方便一眼看到 */
+    wifi_link_t link;
+    wifi_mgr_get_link(&link);
     for (int i = 0; i < n; i++) {
-        if (strcmp(out[i].ssid, s_ssid) == 0) {
+        if (link.connected && strcmp(out[i].ssid, link.ssid) == 0) {
             wifi_ap_t key = out[i];
             memmove(&out[1], &out[0], (size_t)i * sizeof(wifi_ap_t));
             out[0] = key;

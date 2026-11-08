@@ -22,6 +22,15 @@ typedef struct {
     uint8_t authmode; /* wifi_auth_mode_t */
 } wifi_ap_t;
 
+typedef struct {
+    bool connected; /* 已取得 IP；未连接时 ssid/ip 为空 */
+    char ssid[33];
+    char ip[16];
+} wifi_link_t;
+
+/** @brief 在同一临界区内复制连接状态、SSID 和 IP，不访问配置库或显示。 */
+void wifi_mgr_get_link(wifi_link_t *out);
+
 /** @brief 初始化 esp_wifi（STA 模式，不自动连）。 */
 esp_err_t wifi_mgr_init(void);
 
