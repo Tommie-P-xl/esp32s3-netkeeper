@@ -40,8 +40,6 @@
 </head>
 <body>
 <div class="wrap">
-  <h1>校园网守护 · 配置</h1>
-
   <div class="card" id="gate">
     <div class="st"><span class="dot"></span><span class="lbl">需要验证码</span></div>
     <p class="hint" style="margin:4px 0 10px">
@@ -57,6 +55,8 @@
     <div class="hint">验证码每 5 分钟自动更换；有效会话不受换码影响，板子重启后需重新解锁。</div>
   </div>
 
+  <div id="panel" hidden>
+  <h1>校园网守护 · 配置</h1>
   <div class="card" id="status">
     <div class="st"><span class="dot"></span><span class="lbl" id="stext">读取中…</span></div>
     <div class="row"><span>当前 WiFi</span><span id="ssid">-</span></div>
@@ -87,6 +87,7 @@
     </div>
     <div class="hint">添加后会立刻尝试连接；连上之后再到对应的 WiFi 下面添认证账号。</div>
   </div>
+  </div>
 
 </div>
 
@@ -98,7 +99,8 @@ var TOKEN = localStorage.getItem('pg_token') || '';
 document.getElementById('gate_url').textContent = location.origin;
 
 function setUnlocked(yes){
-  document.getElementById('gate').style.display = yes ? 'none' : '';
+  document.getElementById('gate').hidden = yes;
+  document.getElementById('panel').hidden = !yes;
 }
 
 function checkSession(){

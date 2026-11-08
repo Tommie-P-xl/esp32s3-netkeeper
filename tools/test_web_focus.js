@@ -12,6 +12,7 @@ async (page) => {
     };
     window.alert = message => fixture.alerts.push(message);
     window.fetch = async (url, options) => {
+      if (url === '/api/auth') return {json: async () => ({ok: true, token: 'focus-test-session'})};
       if (url === '/api/state') {
         fixture.polls++;
         const data = JSON.parse(JSON.stringify(fixture.state));
@@ -28,8 +29,16 @@ async (page) => {
       }
       throw new Error('Unexpected request in focus test: ' + url);
     };
+    lockNow();
     load();
   });
+  const code = page.getByPlaceholder('6 位验证码');
+  await code.fill('123456');
+  await page.waitForTimeout(3500);
+  check(await code.evaluate(el => document.activeElement === el) && await code.inputValue() === '123456',
+    'Polling interrupted the locked-page verification input');
+  await page.getByRole('button', {name: '解锁', exact: true}).click();
+  await page.locator('#panel').waitFor({state: 'visible'});
   const account = page.getByPlaceholder('校园网账号');
   const password = page.getByPlaceholder('密码', {exact: true});
   await account.waitFor();
@@ -65,7 +74,7 @@ async (page) => {
   check(await password.inputValue() === 'draft-password', 'Password draft was lost');
 
   // Static fields must also retain focus while unrelated list data changes.
-  for (const id of ['gate_code', 'n_ssid', 'n_pass']) {
+  for (const id of ['n_ssid', 'n_pass']) {
     const field = page.locator('#' + id);
     await field.fill(id === 'gate_code' ? '123456' : 'static-draft');
     await page.evaluate(() => { webFocusFixture.state.nets[0].active = !webFocusFixture.state.nets[0].active; load(); });
