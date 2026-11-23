@@ -4,10 +4,11 @@ async (page) => {
   const check = (condition, message) => { if (!condition) throw new Error(message); };
   await page.evaluate(() => {
     const fixture = window.webFocusFixture = {
-      polls: 0, submitted: [], alerts: [], reply: {ok: false, msg: 'test rejection'}, delay: false,
+      polls: 0, submitted: [], wifiCalls: [], alerts: [], reply: {ok: false, msg: 'test rejection'}, delay: false,
       state: {state: 'ONLINE', stext: '外网正常', ssid: 'ExampleWiFi', ip: '192.0.2.1', account: 'saved',
-        auth_count: 0, next_in_ms: 60000, sd: true, nets: [
-          {ssid: 'ExampleWiFi', active: true, current: 'saved', has_pass: true, accts: [{user: 'saved'}]}
+        auth_count: 0, next_in_ms: 60000, sentinel: 'ICMP', sd: true, nets: [
+          {ssid: 'ExampleWiFi', active: true, current: 'saved', has_pass: true, accts: [{user: 'saved'}]},
+          {ssid: "Tom's \"Lab\"\\WiFi", active: false, current: '', has_pass: true, accts: []}
         ]}
     };
     window.alert = message => fixture.alerts.push(message);
@@ -18,6 +19,10 @@ async (page) => {
         const data = JSON.parse(JSON.stringify(fixture.state));
         data.detail = 'test poll ' + fixture.polls;
         return {json: async () => data};
+      }
+      if (url === '/api/wifi' && options.method === 'POST') {
+        fixture.wifiCalls.push(options.body);
+        return {json: async () => ({ok: true, msg: 'ok'})};
       }
       if (url === '/api/acct' && options.method === 'POST') {
         const submitted = Object.fromEntries(new URLSearchParams(options.body));
@@ -39,8 +44,8 @@ async (page) => {
     'Polling interrupted the locked-page verification input');
   await page.getByRole('button', {name: '解锁', exact: true}).click();
   await page.locator('#panel').waitFor({state: 'visible'});
-  const account = page.getByPlaceholder('校园网账号');
-  const password = page.getByPlaceholder('密码', {exact: true});
+  const account = page.locator('#nets .net').first().getByPlaceholder('校园网账号');
+  const password = page.locator('#nets .net').first().getByPlaceholder('密码', {exact: true});
   await account.waitFor();
   await account.fill('draft-account');
   const original = await account.elementHandle();
@@ -83,11 +88,11 @@ async (page) => {
     check(await field.inputValue() === (id === 'gate_code' ? '123456' : 'static-draft'), 'Static draft was lost');
   }
 
-  await page.getByRole('button', {name: '添加账号', exact: true}).click();
+  await page.locator('#nets .net').first().getByRole('button', {name: '添加账号', exact: true}).click();
   await page.waitForFunction(() => webFocusFixture.alerts.length === 1);
   check(await account.inputValue() === 'draft-account' && await password.inputValue() === 'draft-password', 'Rejected save erased a draft');
   await page.evaluate(() => { webFocusFixture.reply = {ok: true}; });
-  await page.getByRole('button', {name: '添加账号', exact: true}).click();
+  await page.locator('#nets .net').first().getByRole('button', {name: '添加账号', exact: true}).click();
   await page.waitForFunction(() => document.querySelector('#nets input').value === '');
   check(await password.inputValue() === '', 'Successful save did not clear submitted password');
 
@@ -95,14 +100,24 @@ async (page) => {
   await account.fill('submitted-account');
   await password.fill('submitted-password');
   await page.evaluate(() => { webFocusFixture.delay = true; });
-  await page.getByRole('button', {name: '添加账号', exact: true}).click();
+  await page.locator('#nets .net').first().getByRole('button', {name: '添加账号', exact: true}).click();
   await page.waitForFunction(() => typeof webFocusFixture.release === 'function');
   await account.fill('next-account-draft');
   await password.fill('next-password-draft');
   await page.evaluate(() => webFocusFixture.release());
   await page.waitForTimeout(200);
   check(await account.inputValue() === 'next-account-draft' && await password.inputValue() === 'next-password-draft', 'Delayed success erased newer input');
+
+  // Switching to an existing SSID with quotes/backslash must work and MUST omit `pass`.
+  await page.getByRole('button', {name: '切到此网', exact: true}).click();
+  await page.waitForFunction(() => webFocusFixture.wifiCalls.length === 1);
+  const wifiBody = await page.evaluate(() => webFocusFixture.wifiCalls[0]);
+  const wifiParams = new URLSearchParams(wifiBody);
+  check(wifiParams.get('ssid') === "Tom's \"Lab\"\\WiFi" && wifiParams.get('use') === '1' && !wifiParams.has('pass'),
+    'Switch WiFi mangled special SSID or sent empty pass: ' + wifiBody);
+  check(await page.locator('#next').count() === 0, 'Deprecated next-check row is still present');
   return {viewport: page.viewportSize(), automaticPolls: await page.evaluate(() => webFocusFixture.polls),
     passed: ['focus, node identity and selection across polls', 'deferred list update and composition',
-      'account/password drafts', 'static input focus', 'failed and successful save', 'delayed save preserves newer draft']};
+      'account/password drafts', 'static input focus', 'failed and successful save',
+      'delayed save preserves newer draft', 'special-char SSID switch omits pass', 'next-check row removed']};
 }

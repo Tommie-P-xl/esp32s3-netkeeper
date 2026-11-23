@@ -65,6 +65,16 @@ static void portal_defaults(portal_info_t *pi)
     nvs_close(h);
 }
 
+bool srun_portal_current(portal_info_t *pi)
+{
+    if (pi == NULL) {
+        return false;
+    }
+    memset(pi, 0, sizeof(*pi));
+    portal_defaults(pi);
+    return srun_portal_configured(pi);
+}
+
 static void portal_remember(const portal_info_t *pi)
 {
     if (!srun_portal_configured(pi)) return;
@@ -238,12 +248,13 @@ probe_result_t srun_probe(portal_info_t *pi)
                 strlcpy(pi->detail, "需要校园网认证", sizeof(pi->detail));
                 res = PROBE_NEED_AUTH;
             } else {
-                strlcpy(pi->detail, "认证会话在线，外网检测异常", sizeof(pi->detail));
+                strlcpy(pi->detail, "认证在线，外网检测异常", sizeof(pi->detail));
+                res = PROBE_ONLINE_NO_WAN;
             }
             goto done;
         }
     }
-    strlcpy(pi->detail, srun_portal_configured(pi) ? "外网与认证服务器均不可达或响应异常" :
+    strlcpy(pi->detail, srun_portal_configured(pi) ? "上联断开，认证服务器不可达" :
             "未发现有效认证地址，请配置 Portal", sizeof(pi->detail));
 done:
     free(r);

@@ -63,7 +63,6 @@
     <div class="row"><span>IP</span><span id="ip">-</span></div>
     <div class="row"><span>认证账号</span><span id="acct">-</span></div>
     <div class="row"><span>重新认证</span><span id="cnt">0 次</span></div>
-    <div class="row"><span>下次检测</span><span id="next">-</span></div>
     <div class="row"><span>最近结果</span><span id="detail">-</span></div>
     <div style="display:flex;gap:8px;margin-top:12px;flex-wrap:wrap">
       <button class="primary" onclick="post('/api/check')">立即检测</button>
@@ -140,20 +139,16 @@ function unlock(){
   }).catch(function(e){ alert('请求失败：' + e); });
 }
 
-function fmt(ms){
-  if(!ms || ms < 0) return '--:--';
-  var s = Math.floor(ms/1000), m = Math.floor(s/60), h = Math.floor(m/60);
-  if(h > 0) return h + ':' + String(m%60).padStart(2,'0') + ':' + String(s%60).padStart(2,'0');
-  return String(m).padStart(2,'0') + ':' + String(s%60).padStart(2,'0');
-}
 function esc(s){
   return String(s == null ? '' : s).replace(/[&<>"']/g, function(c){
     return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c];
   });
 }
 function body(o){
-  return Object.keys(o).map(function(k){
-    return encodeURIComponent(k) + '=' + encodeURIComponent(o[k] == null ? '' : o[k]);
+  return Object.keys(o).filter(function(k){
+    return o[k] !== null && o[k] !== undefined;
+  }).map(function(k){
+    return encodeURIComponent(k) + '=' + encodeURIComponent(o[k]);
   }).join('&');
 }
 function post(url, data){
@@ -187,7 +182,6 @@ function load(){
     document.getElementById('ip').textContent = s.ip || '-';
     document.getElementById('acct').textContent = s.account || '-';
     document.getElementById('cnt').textContent = s.auth_count + ' 次';
-    document.getElementById('next').textContent = fmt(s.next_in_ms);
     document.getElementById('detail').textContent = s.detail || '-';
     document.getElementById('store').textContent = s.sd ? 'Flash + SD 卡（SD 优先）' : '仅片上 Flash';
     renderNets(s.nets || []);
@@ -200,6 +194,14 @@ function load(){
   });
 }
 
+function findAcctInput(ssid, field){
+  var inputs = document.getElementById('nets').querySelectorAll('input[data-field]');
+  for(var i = 0; i < inputs.length; i++){
+    if(inputs[i].dataset.ssid === ssid && inputs[i].dataset.field === field) return inputs[i];
+  }
+  return null;
+}
+
 function renderNets(nets){
   lastNets = nets;
   var host = document.getElementById('nets');
@@ -208,42 +210,57 @@ function renderNets(nets){
   /* 状态仍每 3 秒更新，编辑中的输入框保留到失焦后的下一次刷新，避免打断键盘和输入法。 */
   var focused = document.activeElement;
   if(host.contains(focused) && focused.tagName === 'INPUT') return;
-  var drafts = Array.from(host.querySelectorAll('input')).map(function(input){
-    return {id: input.id, value: input.value};
+  var drafts = Array.from(host.querySelectorAll('input[data-field]')).map(function(input){
+    return {ssid: input.dataset.ssid, field: input.dataset.field, value: input.value};
   });
   if(!nets.length){
     host.innerHTML = '<div class="empty">还没有保存任何 WiFi。用下面的表单添加，或在板子的屏幕上配网。</div>';
     renderedNets = signature;
     return;
   }
-  host.innerHTML = nets.map(function(n){
+  host.innerHTML = nets.map(function(n, ni){
     var isActive = n.active;
-    var accts = (n.accts || []).map(function(a){
+    var accts = (n.accts || []).map(function(a, ai){
       var cur = a.user === n.current;
       return '<div class="acct">' +
         '<span class="u">' + esc(a.user) + (cur ? '<span class="tag on">使用中</span>' : '') + '</span>' +
-        '<span>' + (cur ? '' : '<button onclick="useAcct(\'' + esc(n.ssid) + '\',\'' + esc(a.user) + '\')">设为当前</button> ') +
-        '<button class="danger" onclick="delAcct(\'' + esc(n.ssid) + '\',\'' + esc(a.user) + '\')">删除</button></span>' +
+        '<span>' + (cur ? '' : '<button data-act="use-acct" data-ni="' + ni + '" data-ai="' + ai + '">设为当前</button> ') +
+        '<button class="danger" data-act="del-acct" data-ni="' + ni + '" data-ai="' + ai + '">删除</button></span>' +
       '</div>';
     }).join('');
-    return '<div class="net">' +
+    return '<div class="net" data-ni="' + ni + '">' +
       '<div class="ssid"><b>' + esc(n.ssid) + (isActive ? '<span class="tag on">当前网络</span>' : '') + '</b>' +
-        '<span>' + (isActive ? '' : '<button onclick="useWifi(\'' + esc(n.ssid) + '\')">切到此网</button> ') +
-        '<button class="danger" onclick="delWifi(\'' + esc(n.ssid) + '\')">删除</button></span></div>' +
+        '<span>' + (isActive ? '' : '<button data-act="use-wifi" data-ni="' + ni + '">切到此网</button> ') +
+        '<button class="danger" data-act="del-wifi" data-ni="' + ni + '">删除</button></span></div>' +
       (accts || '<div class="empty">这个 WiFi 下还没有认证账号</div>') +
       '<div class="form">' +
-        '<input id="u_' + esc(n.ssid) + '" placeholder="校园网账号">' +
-        '<input id="p_' + esc(n.ssid) + '" placeholder="密码">' +
-        '<button onclick="addAcct(\'' + esc(n.ssid) + '\')">添加账号</button>' +
+        '<input data-ssid="' + esc(n.ssid) + '" data-field="user" placeholder="校园网账号">' +
+        '<input data-ssid="' + esc(n.ssid) + '" data-field="pass" placeholder="密码">' +
+        '<button data-act="add-acct" data-ni="' + ni + '">添加账号</button>' +
       '</div>' +
     '</div>';
   }).join('');
   drafts.forEach(function(draft){
-    var input = document.getElementById(draft.id);
-    if(input && host.contains(input)) input.value = draft.value;
+    var input = findAcctInput(draft.ssid, draft.field);
+    if(input) input.value = draft.value;
   });
   renderedNets = signature;
 }
+
+document.getElementById('nets').addEventListener('click', function(ev){
+  var btn = ev.target.closest('button[data-act]');
+  if(!btn) return;
+  var net = lastNets[Number(btn.dataset.ni)];
+  if(!net) return;
+  var act = btn.dataset.act;
+  if(act === 'use-wifi'){ useWifi(net.ssid); return; }
+  if(act === 'del-wifi'){ delWifi(net.ssid); return; }
+  if(act === 'add-acct'){ addAcct(net.ssid); return; }
+  var acct = (net.accts || [])[Number(btn.dataset.ai)];
+  if(!acct) return;
+  if(act === 'use-acct') useAcct(net.ssid, acct.user);
+  else if(act === 'del-acct') delAcct(net.ssid, acct.user);
+});
 
 function addWifi(){
   var ssid = document.getElementById('n_ssid').value.trim();
@@ -252,13 +269,15 @@ function addWifi(){
   post('/api/wifi', {ssid: ssid, pass: pass});
 }
 function addAcct(ssid){
-  var u = document.getElementById('u_' + ssid).value.trim();
-  var p = document.getElementById('p_' + ssid).value;
+  var userInput = findAcctInput(ssid, 'user');
+  var passInput = findAcctInput(ssid, 'pass');
+  var u = userInput ? userInput.value.trim() : '';
+  var p = passInput ? passInput.value : '';
   if(!u){ alert('请填写账号'); return; }
   return post('/api/acct', {ssid: ssid, user: u, pass: p, use: 1}).then(function(j){
     /* 仅清空本次成功提交的内容；失败或提交后继续编辑时保留草稿。 */
-    var user = document.getElementById('u_' + ssid);
-    var pass = document.getElementById('p_' + ssid);
+    var user = findAcctInput(ssid, 'user');
+    var pass = findAcctInput(ssid, 'pass');
     if(j && j.ok && user && pass && user.value.trim() === u && pass.value === p){
       user.value = '';
       pass.value = '';
@@ -274,7 +293,7 @@ function delWifi(ssid){
   if(!confirm('删除网络 ' + ssid + ' 及其全部账号 ?')) return;
   post('/api/remove', {type: 'wifi', ssid: ssid});
 }
-function useWifi(ssid){ post('/api/wifi', {ssid: ssid, pass: null, use: 1}); }
+function useWifi(ssid){ post('/api/wifi', {ssid: ssid, use: 1}); }
 function useAcct(ssid, user){ post('/api/use', {ssid: ssid, user: user}); }
 
 function lockNow(){

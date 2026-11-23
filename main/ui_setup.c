@@ -549,12 +549,15 @@ static void acct_back_cb(lv_event_t *e)
     go_main();
 }
 
+static void refresh_acct_list(void);
+
 static void acct_use_cb(lv_event_t *e)
 {
     const char *user = (const char *)lv_event_get_user_data(e);
     if (db_set_current_acct(s_acct_ssid, user) == ESP_OK) {
         db_set_active_ssid(s_acct_ssid);
         net_guard_switch_account(s_acct_ssid, user);
+        refresh_acct_list();
         ui_toast("已设为自动登录账号");
     } else {
         ui_toast("切换失败");

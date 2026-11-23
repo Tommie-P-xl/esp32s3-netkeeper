@@ -102,7 +102,7 @@ static void md5_raw(const uint8_t *data, size_t len, uint8_t out[16])
     }
 
     const size_t rest = len - i;
-    const size_t tail_len = (rest + 8 < 56) ? 64 : 128;
+    const size_t tail_len = (rest < 56) ? 64 : 128;
 
     memset(tail, 0, sizeof(tail));
     if (rest > 0) {
@@ -189,7 +189,7 @@ static void sha1_raw(const uint8_t *data, size_t len, uint8_t out[20])
     }
 
     const size_t rest = len - i;
-    const size_t tail_len = (rest + 8 < 56) ? 64 : 128;
+    const size_t tail_len = (rest < 56) ? 64 : 128;
 
     memset(tail, 0, sizeof(tail));
     if (rest > 0) {

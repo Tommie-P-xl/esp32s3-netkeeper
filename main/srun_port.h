@@ -30,10 +30,14 @@ typedef struct {
 /** @brief 主机为可用 HTTP(S) origin 且 ac_id 有效；空地址、占位地址不可用。 */
 bool srun_portal_configured(const portal_info_t *pi);
 
+/** @brief 读取当前 WiFi 缓存（或编译期兜底）的可用 Portal 配置。 */
+bool srun_portal_current(portal_info_t *pi);
+
 typedef enum {
-    PROBE_ONLINE = 0,  /* 外网通 */
-    PROBE_NEED_AUTH,   /* 被劫持到 Portal，需要认证 */
-    PROBE_NO_LINK,     /* Portal 都摸不到（WiFi 掉了 / 网关不通） */
+    PROBE_ONLINE = 0,       /* 外网通 */
+    PROBE_NEED_AUTH,        /* Portal 可达且明确返回未在线，满足认证条件 */
+    PROBE_ONLINE_NO_WAN,    /* Portal 可达且会话仍在线，但外网检测异常（禁止误登录/注销） */
+    PROBE_NO_LINK,          /* 外网与 Portal 均不可达（网线/上联断开或未配置 Portal，禁止发认证） */
 } probe_result_t;
 
 /**

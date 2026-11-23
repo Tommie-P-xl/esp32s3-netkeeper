@@ -27,7 +27,6 @@ typedef struct {
     lv_obj_t *v_ssid;
     lv_obj_t *v_ip;
     lv_obj_t *v_auth;
-    lv_obj_t *v_next;
     lv_obj_t *v_uptime;
     lv_obj_t *v_code;      /* 网页验证码 */
     lv_obj_t *v_code_ttl;  /* 验证码倒计时 */
@@ -126,12 +125,16 @@ static void on_acct(lv_event_t *e)
 
 /* --------------------------------------------------------------- 刷新 */
 
+static void set_label_if_changed(lv_obj_t *lbl, const char *text)
+{
+    if (strcmp(lv_label_get_text(lbl), text) != 0) {
+        lv_label_set_text(lbl, text);
+    }
+}
+
 static void set_state_text(const char *text)
 {
-    if (strcmp(lv_label_get_text(s_ui.state_big), text) == 0) {
-        return;
-    }
-    lv_label_set_text(s_ui.state_big, text);
+    set_label_if_changed(s_ui.state_big, text);
 }
 
 static void ui_timer_cb(lv_timer_t *t)
@@ -168,34 +171,30 @@ static void ui_timer_cb(lv_timer_t *t)
     fmt_state(st.state, &big, &cn, &col);
 
     set_state_text(big);
-    lv_label_set_text(s_ui.state_cn, cn);
+    set_label_if_changed(s_ui.state_cn, cn);
     lv_obj_set_style_bg_color(s_ui.dot, col, 0);
 
     /* 优先显示连着的那个，没连上就显示目标 */
-    lv_label_set_text(s_ui.v_ssid, st.ssid[0] ? st.ssid : (st.target[0] ? st.target : "-"));
+    set_label_if_changed(s_ui.v_ssid, st.ssid[0] ? st.ssid : (st.target[0] ? st.target : "-"));
 
     /* IP 行直接给出完整配置地址，照着敲就行 */
     if (st.ip[0]) {
         char url[48];
         snprintf(url, sizeof(url), "http://%s", st.ip);
-        lv_label_set_text(s_ui.v_ip, url);
+        set_label_if_changed(s_ui.v_ip, url);
     } else {
-        lv_label_set_text(s_ui.v_ip, "未联网");
+        set_label_if_changed(s_ui.v_ip, "未联网");
     }
-    lv_label_set_text_fmt(s_ui.v_auth, "%d 次", st.auth_count);
-
-    if (st.next_check_ms > now) {
-        char buf[16];
-        fmt_dur(buf, sizeof(buf), (st.next_check_ms - now) / 1000);
-        lv_label_set_text(s_ui.v_next, buf);
-    } else {
-        lv_label_set_text(s_ui.v_next, "--:--");
+    {
+        char auth_buf[24];
+        snprintf(auth_buf, sizeof(auth_buf), "%d 次", st.auth_count);
+        set_label_if_changed(s_ui.v_auth, auth_buf);
     }
 
     {
         char buf[16];
         fmt_dur(buf, sizeof(buf), (now - st.boot_ms) / 1000);
-        lv_label_set_text(s_ui.v_uptime, buf);
+        set_label_if_changed(s_ui.v_uptime, buf);
     }
 
     /* 电池：没插电池整行不显示；插着 USB 只报百分比 + 充电状态（不估续航） */
@@ -242,16 +241,16 @@ static void ui_timer_cb(lv_timer_t *t)
         web_code_get(code);
         char pretty[8];
         snprintf(pretty, sizeof(pretty), "%.3s %.3s", code, code + 3);
-        lv_label_set_text(s_ui.v_code, pretty);
+        set_label_if_changed(s_ui.v_code, pretty);
 
         const int64_t left_s = web_code_remain_ms() / 1000;
         char ttl[24];
         snprintf(ttl, sizeof(ttl), "剩余 %02lld:%02lld",
                  (long long)(left_s / 60), (long long)(left_s % 60));
-        lv_label_set_text(s_ui.v_code_ttl, ttl);
+        set_label_if_changed(s_ui.v_code_ttl, ttl);
     }
 
-    lv_label_set_text(s_ui.msg, st.detail);
+    set_label_if_changed(s_ui.msg, st.detail);
     lv_obj_set_style_text_color(s_ui.msg, (st.state == NET_ONLINE) ? UI_COL_MUTED : col, 0);
 }
 
@@ -372,18 +371,17 @@ void ui_create(lv_display_t *disp)
     lv_obj_set_pos(s_ui.v_code_ttl, 252, 126);
 
     /* ---------------- 信息行 ---------------- */
-    s_ui.v_ssid = make_row(scr, 216, "网络");
-    s_ui.v_ip = make_row(scr, 246, "配置网址");
-    s_ui.v_auth = make_row(scr, 276, "重新认证");
-    s_ui.v_next = make_row(scr, 306, "下次检测");
-    s_ui.v_uptime = make_row(scr, 336, "运行时长");
+    s_ui.v_ssid = make_row(scr, 222, "网络");
+    s_ui.v_ip = make_row(scr, 258, "配置网址");
+    s_ui.v_auth = make_row(scr, 294, "重新认证");
+    s_ui.v_uptime = make_row(scr, 330, "运行时长");
     lv_obj_set_style_text_color(s_ui.v_auth, UI_COL_AMBER, 0);
 
     /* ---------------- 最近结果 ---------------- */
     s_ui.msg = ui_label(scr, "启动中", &ui_font_18, UI_COL_MUTED);
     lv_label_set_long_mode(s_ui.msg, LV_LABEL_LONG_CLIP);
     lv_obj_set_width(s_ui.msg, 428);
-    lv_obj_set_pos(s_ui.msg, 26, 372);
+    lv_obj_set_pos(s_ui.msg, 26, 368);
 
     /* ---------------- 按钮 ---------------- */
     lv_obj_t *b1 = ui_button(scr, "立即检测", true, on_check, NULL);

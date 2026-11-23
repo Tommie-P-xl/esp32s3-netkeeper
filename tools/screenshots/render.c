@@ -50,18 +50,26 @@ esp_err_t db_remove_acct(const char *ssid, const char *user)
     return ESP_OK;
 }
 esp_err_t db_set_current_acct(const char *ssid, const char *user)
-{ (void)ssid; (void)user; return ESP_OK; }
+{
+    for (unsigned i = 0; i < sizeof(demo_nets) / sizeof(*demo_nets); ++i) {
+        if (!strcmp(ssid, demo_nets[i].ssid)) {
+            strlcpy(demo_nets[i].current, user, sizeof(demo_nets[i].current));
+            return ESP_OK;
+        }
+    }
+    return ESP_FAIL;
+}
 void net_guard_trigger(void) {}
+void net_guard_on_wake(void) {}
 void net_guard_switch_account(const char *ssid, const char *user) { (void)ssid; (void)user; }
 void net_guard_try_ssid(const char *ssid) { (void)ssid; }
 void net_guard_get(net_status_t *out)
 {
     *out = (net_status_t){.state = demo_state, .ssid = "ExampleWiFi", .target = "ExampleWiFi",
         .ip = "192.0.2.10", .account = "demo-user-01", .portal = "http://portal.example.edu",
-        .auth_count = 2, .boot_ms = 0, .next_check_ms = 4700000, .detail = "外网正常"};
+        .sentinel = "ICMP", .auth_count = 2, .boot_ms = 0, .next_check_ms = 0, .detail = "已联网，认证账号已核实"};
     if (demo_state == NET_NO_ACCOUNT) {
         out->account[0] = '\0';
-        out->next_check_ms = 0;
         out->auth_count = 0;
         strlcpy(out->detail, "缺少认证账号", sizeof(out->detail));
     }
@@ -129,6 +137,17 @@ static void capture(const char *folder, const char *name)
     fclose(file);
     lv_draw_buf_destroy(snap);
     printf("Rendered %s\n", name);
+}
+static lv_obj_t *find_label(lv_obj_t *parent, const char *text)
+{
+    if (lv_obj_check_type(parent, &lv_label_class) && !strcmp(lv_label_get_text(parent), text)) {
+        return parent;
+    }
+    for (unsigned i = 0; i < lv_obj_get_child_count(parent); ++i) {
+        lv_obj_t *found = find_label(lv_obj_get_child(parent, i), text);
+        if (found) return found;
+    }
+    return NULL;
 }
 static lv_obj_t *find_button(lv_obj_t *parent, const char *text)
 {
@@ -216,7 +235,13 @@ int main(int argc, char **argv)
     demo_state = NET_ONLINE;
     advance(500);
     check_state_layout();
-    puts("PASS all 11 full status names use the same 40px font, fit completely and do not overlap verification widgets");
+    assert(find_label(ui_screen_main(), "下次检测") == NULL);
+    /* Back-to-back toasts must cancel the previous timer cleanly (no UAF on expiry). */
+    ui_toast("第一次提示");
+    advance(200);
+    ui_toast("第二次提示");
+    advance(2200);
+    puts("PASS all 11 full status names use the same 40px font, fit completely, no next-check row and safe repeated toasts");
     ui_setup_open_wifi();
     complete_scan();
     advance(100);
@@ -276,6 +301,13 @@ int main(int argc, char **argv)
     show_delete_confirm("ExampleWiFi", NULL);
     click(s_delete_modal, "确认删除");
     assert(!s_delete_modal && net_deletions == 1); /* Active network protection still applies. */
-    puts("PASS real LVGL delete dialogs: cancel, explicit confirmation, frozen targets, duplicate guard and active-network protection");
+    /* Clicking "使用" immediately updates the account row to "当前". */
+    click(lv_obj_get_child(s_list_acct, 1), "使用");
+    advance(50);
+    assert(find_button(lv_obj_get_child(s_list_acct, 1), "当前") != NULL);
+    assert(find_button(lv_obj_get_child(s_list_acct, 0), "使用") != NULL);
+    click(lv_obj_get_child(s_list_acct, 0), "使用");
+    advance(2000);
+    puts("PASS real LVGL delete dialogs and immediate account-switch highlight");
     return 0;
 }

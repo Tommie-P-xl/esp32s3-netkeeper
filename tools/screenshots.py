@@ -65,9 +65,9 @@ def device_images(lvgl_path):
 
 DEMO_STATE = {
     'state': 'ONLINE', 'stext': '外网正常', 'ssid': 'ExampleWiFi', 'target': 'ExampleWiFi',
-    'ip': '192.0.2.10', 'account': 'demo-user-01', 'auth_count': 2, 'next_in_ms': 150000,
-    'uptime_ms': 4550000, 'detail': '外网正常', 'portal': 'http://portal.example.edu',
-    'sd': True, 'ui': 100, 'stage': 7, 'bat_present': True, 'bat_pct': 82,
+    'ip': '192.0.2.10', 'account': 'demo-user-01', 'auth_count': 2, 'next_in_ms': 0,
+    'uptime_ms': 4550000, 'detail': '已联网，认证账号已核实', 'portal': 'http://portal.example.edu',
+    'sentinel': 'ICMP', 'sd': True, 'ui': 100, 'stage': 7, 'bat_present': True, 'bat_pct': 82,
     'bat_usb': True, 'bat_charging': True, 'bat_min': -1,
     'nets': [{'ssid': 'ExampleWiFi', 'active': True, 'has_pass': True,
               'current': 'demo-user-01', 'accts': [{'user': 'demo-user-01'}, {'user': 'demo-user-02'}]},

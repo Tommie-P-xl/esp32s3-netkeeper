@@ -6,6 +6,7 @@ idf_component_register(
         db.c
         wifi_mgr.c
         net_guard.c
+        net_probe.c
         web.c
         ui.c
         ui_common.c

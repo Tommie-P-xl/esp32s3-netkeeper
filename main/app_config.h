@@ -26,17 +26,38 @@
 #define APP_PORTAL_FALLBACK_HOST  "http://10.253.0.235"
 #define APP_PORTAL_FALLBACK_ACID  "3"
 
-/* ---------------------------------------------------------------- 轮询 */
-#define APP_POLL_INTERVAL_MS   (5 * 60 * 1000)
-#define APP_RETRY_BACKOFF_MS   { 30 * 1000, 60 * 1000, 120 * 1000 }
+/* -------------------------------------------------------- 实时守护与退避 */
+/* 方案 A：外网轻量哨兵（无 DNS）+ 静默防抖 + 完整 204 兜底。
+ * 插 USB 供电或电池亮屏时保持较高响应；电池熄屏时自动拉长间隔省电。 */
+#define APP_SENTINEL_IP_PRIMARY        "223.5.5.5"     /* 阿里多线 Anycast */
+#define APP_SENTINEL_IP_SECONDARY      "119.29.29.29"  /* 腾讯 DNSPod 多线 Anycast */
+#define APP_SENTINEL_TCP_PORT          443             /* 降级 TCP 轻握手端口（BRAS 不劫持） */
+#define APP_SENTINEL_TIMEOUT_MS        1500            /* 单次轻量探测超时 */
+#define APP_SENTINEL_ACTIVE_MS         (15 * 1000)     /* 插电 / 电池亮屏哨兵间隔 */
+#define APP_SENTINEL_SLEEP_MS          (45 * 1000)     /* 电池熄屏省电哨兵间隔 */
+#define APP_SENTINEL_WAKE_COOLDOWN_MS  (5 * 1000)      /* 触摸亮屏即时探测最小冷却 */
+#define APP_SENTINEL_CONFIRM_DELAY1_MS 1000            /* 主目标失手后切备用目标等待 */
+#define APP_SENTINEL_CONFIRM_DELAY2_MS 2000            /* 双目标失手后的第三次确认等待 */
+#define APP_FULL_CHECK_INTERVAL_MS     (15 * 60 * 1000)/* 完整 HTTP 204 兜底校检周期 */
+#define APP_POLL_INTERVAL_MS           APP_FULL_CHECK_INTERVAL_MS
+
+/* 非认证断联监听与业务拒绝退避：
+ *   - 硬件/上联断开（Portal 不可达）：不发认证，轻探端口等待恢复（15 -> 30 -> 60s）
+ *   - 校内在线但外网异常：不注销不重登，低频探测外网恢复（30s / 电池熄屏 60s）
+ *   - 服务端明确拒绝认证（欠费/密码错/超限）：强指数退避（1 -> 3 -> 5 -> 10 min） */
+#define APP_LINK_WAIT_BACKOFF_MS       { 15 * 1000, 30 * 1000, 60 * 1000 }
+#define APP_WAN_WAIT_ACTIVE_MS         (30 * 1000)
+#define APP_WAN_WAIT_SLEEP_MS          (60 * 1000)
+#define APP_RETRY_BACKOFF_MS           { 60 * 1000, 180 * 1000, 300 * 1000, 600 * 1000 }
 
 /* ------------------------------------------------------------ WiFi 超时 */
 #define APP_WIFI_CONNECT_TIMEOUT_MS  20000
 #define APP_WIFI_RETRY_MS            5000
 
 /* ------------------------------------------------------------- 外网探测 */
+/* 国内双多线 204 端点，避免海外 gstatic 不通时退化为单点探测。 */
 #define APP_PROBE_URL_PRIMARY     "http://connect.rom.miui.com/generate_204"
-#define APP_PROBE_URL_SECONDARY   "http://www.gstatic.com/generate_204"
+#define APP_PROBE_URL_SECONDARY   "http://connectivitycheck.platform.hicloud.com/generate_204"
 
 #define APP_HTTP_TIMEOUT_MS       8000
 

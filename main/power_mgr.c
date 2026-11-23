@@ -12,6 +12,7 @@
 
 #include "bsp/esp-bsp.h"
 #include "bsp/display.h"
+#include "net_guard.h"
 #include "ui_common.h"   /* ui_lock / ui_unlock：查 LVGL 的触摸状态要用显示锁 */
 #include "app_config.h"
 #include "display_port.h"
@@ -86,6 +87,7 @@ static bool panel_on(void)
         set_cpu_mhz(ACTIVE_CPU_MHZ);
     }
     s_screen_on = true;
+    net_guard_on_wake();
     ESP_LOGI(TAG, "panel on");
     return true;
 }
@@ -254,8 +256,8 @@ lv_display_t *power_mgr_display_start(void)
 
 esp_err_t power_mgr_start(void)
 {
-    int level = bsp_display_brightness_get();
-    s_brightness = (level > 0) ? level : 100;
+    /* 按 app_config.h 的 APP_BRIGHTNESS 作为运行期亮度上限；仅非法值时回退 100。 */
+    s_brightness = (APP_BRIGHTNESS > 0 && APP_BRIGHTNESS <= 100) ? APP_BRIGHTNESS : 100;
 
     /* The touch INT is open-drain; give it a defined level so a floating pin
      * is not mistaken for a touch. */

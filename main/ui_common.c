@@ -1,12 +1,14 @@
 #include "ui_common.h"
 
 #include <stdio.h>
+#include <string.h>
 
 #include "esp_err.h"
 #include "esp_lv_adapter.h"
 #include "sys_time.h"
 
 static lv_obj_t *s_toast;
+static lv_timer_t *s_toast_timer;
 
 /* 顶部时钟：每块屏一个 label，tick 统一刷新 */
 #define MAX_CLOCKS 8
@@ -34,7 +36,7 @@ void ui_clock_tick(void)
     char buf[8];
     sys_time_str(buf, sizeof(buf));
     for (int i = 0; i < s_clock_n; i++) {
-        if (s_clocks[i] != NULL) {
+        if (s_clocks[i] != NULL && strcmp(lv_label_get_text(s_clocks[i]), buf) != 0) {
             lv_label_set_text(s_clocks[i], buf);
         }
     }
@@ -138,24 +140,39 @@ lv_obj_t *ui_row_card(lv_obj_t *parent, int height)
     return row;
 }
 
-static void toast_timer_cb(lv_timer_t *t)
+static void toast_deleted_cb(lv_event_t *e)
 {
-    lv_obj_t *box = (lv_obj_t *)lv_timer_get_user_data(t);
-    if (box != NULL) {
-        lv_obj_delete(box);
-    }
-    if (s_toast == box) {
+    if (lv_event_get_target(e) == s_toast) {
         s_toast = NULL;
     }
+}
+
+static void toast_timer_cb(lv_timer_t *t)
+{
+    lv_obj_t *box = s_toast;
+    if (s_toast_timer == t) {
+        s_toast_timer = NULL;
+    }
     lv_timer_delete(t);
+    s_toast = NULL;
+    if (box != NULL && lv_obj_is_valid(box)) {
+        lv_obj_delete(box);
+    }
 }
 
 void ui_toast(const char *msg)
 {
     lv_obj_t *scr = lv_screen_active();
 
+    /* 必须先取消旧定时器再删旧气泡，防止连续触发时旧定时器二次释放对象。 */
+    if (s_toast_timer != NULL) {
+        lv_timer_delete(s_toast_timer);
+        s_toast_timer = NULL;
+    }
     if (s_toast != NULL && lv_obj_is_valid(s_toast)) {
-        lv_obj_delete(s_toast);
+        lv_obj_t *old = s_toast;
+        s_toast = NULL;
+        lv_obj_delete(old);
     }
 
     lv_obj_t *box = lv_obj_create(scr);
@@ -169,10 +186,11 @@ void ui_toast(const char *msg)
     lv_obj_align(box, LV_ALIGN_BOTTOM_MID, 0, -92);
     ui_obj_scrollable(box, false);
     ui_obj_clickable(box, false);
+    lv_obj_add_event_cb(box, toast_deleted_cb, LV_EVENT_DELETE, NULL);
 
     lv_obj_t *l = ui_label(box, msg, &ui_font_18, UI_COL_BG);
     lv_obj_center(l);
 
     s_toast = box;
-    lv_timer_create(toast_timer_cb, 1800, box);
+    s_toast_timer = lv_timer_create(toast_timer_cb, 1800, NULL);
 }

@@ -319,13 +319,14 @@ static esp_err_t h_state(httpd_req_t *req)
         next_in = 0;
     }
 
-    char ssid[80], target[80], ip[32], acct[80], portal[96], detail[160];
+    char ssid[80], target[80], ip[32], acct[80], portal[96], detail[160], sentinel[24];
     json_esc(ssid, sizeof(ssid), st.ssid);
     json_esc(target, sizeof(target), st.target);
     json_esc(ip, sizeof(ip), st.ip);
     json_esc(acct, sizeof(acct), st.account);
     json_esc(portal, sizeof(portal), st.portal);
     json_esc(detail, sizeof(detail), st.detail);
+    json_esc(sentinel, sizeof(sentinel), st.sentinel);
 
     batt_info_t bat;
     batt_mgr_get(&bat);
@@ -333,17 +334,17 @@ static esp_err_t h_state(httpd_req_t *req)
     httpd_resp_set_type(req, "application/json");
     httpd_resp_set_hdr(req, "Cache-Control", "no-store");
 
-    char head[640];
+    char head[768];
     snprintf(head, sizeof(head),
              "{\"state\":\"%s\",\"stext\":\"%s\",\"ssid\":\"%s\",\"target\":\"%s\","
              "\"ip\":\"%s\",\"account\":\"%s\",\"auth_count\":%d,\"next_in_ms\":%lld,"
-             "\"uptime_ms\":%lld,\"detail\":\"%s\",\"portal\":\"%s\",\"sd\":%s,\"ui\":%u,"
-             "\"stage\":%d,"
+             "\"uptime_ms\":%lld,\"detail\":\"%s\",\"portal\":\"%s\",\"sentinel\":\"%s\","
+             "\"sd\":%s,\"ui\":%u,\"stage\":%d,"
              "\"bat_present\":%s,\"bat_pct\":%d,\"bat_mv\":%d,\"bat_usb\":%s,"
              "\"bat_charging\":%s,\"bat_min\":%d,\"nets\":[",
              state_id(st.state), state_text(st.state), ssid, target, ip, acct,
              st.auth_count, (long long)next_in, (long long)(now - st.boot_ms),
-             detail, portal, db_sd_present() ? "true" : "false",
+             detail, portal, sentinel, db_sd_present() ? "true" : "false",
              (unsigned)ui_tick_count(), ui_setup_scan_stage(),
              bat.present ? "true" : "false", bat.pct, bat.mv,
              bat.usb ? "true" : "false", bat.charging ? "true" : "false",
@@ -454,10 +455,8 @@ static esp_err_t h_wifi(httpd_req_t *req)
         }
         net_guard_try_ssid(ssid);
     } else if (want_use) {
-        if (db_set_active_ssid(ssid) != ESP_OK) {
-            return reply(req, false, "保存失败，请检查存储状态");
-        }
-        net_guard_trigger();
+        /* 切换到已保存网络：保留原有密码，先试连成功再切 active，避免连不上失联。 */
+        net_guard_try_ssid(ssid);
     } else {
         net_guard_trigger();
     }
