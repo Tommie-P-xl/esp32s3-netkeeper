@@ -291,7 +291,7 @@ static void calibrate_sentinel(const char *ssid, const portal_info_t *pi)
 }
 
 /*
- * 方案 A 静默防抖确认：
+ * 轻量哨兵静默防抖确认：
  *   1. 首选 IP 失手不改 UI，等 1 s 换备用 IP 复测；备用通则判偶发波动并切换首选。
  *   2. 主备双失手时，若存在校园 Portal 立刻用 ~10 ms 校内 rad_user_info 裁决：
  *      - 明确 not_online -> 100% 实锤认证掉了，当场返回 SENTINEL_DOWN 立即认证。

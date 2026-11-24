@@ -1065,7 +1065,7 @@ int main(void) {
  net_guard_on_wake();
  assert(consume_wake_flag() && !consume_wake_flag());
 
- puts("PASS Scheme-A sentinel calibration/fallback, anti-flap, fast auth-drop, 0-auth cable/WAN recovery and power cadence");
+ puts("PASS tiered sentinel calibration/fallback, anti-flap, fast auth-drop, 0-auth cable/WAN recovery and power cadence");
 }
 '''
 

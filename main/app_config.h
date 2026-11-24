@@ -27,7 +27,7 @@
 #define APP_PORTAL_FALLBACK_ACID  "3"
 
 /* -------------------------------------------------------- 实时守护与退避 */
-/* 方案 A：外网轻量哨兵（无 DNS）+ 静默防抖 + 完整 204 兜底。
+/* 分层实时监测：外网轻量哨兵（无 DNS）+ 静默防抖 + 完整 204 兜底。
  * 插 USB 供电或电池亮屏时保持较高响应；电池熄屏时自动拉长间隔省电。 */
 #define APP_SENTINEL_IP_PRIMARY        "223.5.5.5"     /* 阿里多线 Anycast */
 #define APP_SENTINEL_IP_SECONDARY      "119.29.29.29"  /* 腾讯 DNSPod 多线 Anycast */
